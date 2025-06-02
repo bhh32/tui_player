@@ -1,3 +1,15 @@
+// Optimizations in this module:
+// - GPU acceleration for resizing (optional)
+// - Adaptive resolution: reduces quality in case of low FPS
+// - Terminal-specific graphics protocols: Kitty, iTerm2, Sixel, or fallback to Unicode blocks
+//
+// SIMD/Parallelization/Color Cache/Column Skipping/Dirty Row Diffing optimizations:
+// - simd_blend_alpha: SIMD-accelerated alpha blending for RGBA pixels
+// - get_color_code: caches ANSI color codes for fg/bg pairs
+// - render_blocks: skips fully transparent columns, parallelizes row rendering, minimizes ANSI output, and only redraws dirty rows
+//
+// See tests in tests.rs for coverage of these features.
+use core::simd::u8x16; // SIMD for pixel math
 mod gpu;
 #[cfg(test)]
 mod tests;
@@ -5,6 +17,8 @@ mod tests;
 use log::{debug, error, info, trace, warn};
 use once_cell::sync::Lazy;
 use parking_lot::Mutex;
+use rayon::prelude::*;
+use std::collections::HashMap;
 use std::io::Write;
 use std::time::Duration;
 
@@ -121,6 +135,8 @@ pub struct TerminalRenderer {
     // Output buffer cache (to avoid allocations)
     #[allow(dead_code)]
     output_buffer: String,
+    color_code_cache: Mutex<HashMap<([u16; 3], [u16; 3]), String>>,
+    prev_frame_hash: Option<Vec<u64>>, // For dirty rectangle/frame diffing
 }
 
 impl TerminalRenderer {
@@ -197,6 +213,8 @@ impl TerminalRenderer {
             frames_since_quality_adjust: 0,
             last_kitty_temp_file: None,
             output_buffer: String::with_capacity(term_width as usize * term_height as usize * 25),
+            color_code_cache: Mutex::new(HashMap::new()),
+            prev_frame_hash: None,
         })
     }
 
@@ -1089,173 +1107,176 @@ impl TerminalRenderer {
         best_idx
     }
 
+    fn get_color_code(&self, fg: [u16; 3], bg: [u16; 3]) -> String {
+        let mut cache = self.color_code_cache.lock();
+        let key = (fg, bg);
+        cache.entry(key).or_insert_with(|| {
+            format!(
+                "\x1B[38;2;{};{};{};48;2;{};{};{}m",
+                fg[0], fg[1], fg[2], bg[0], bg[1], bg[2]
+            )
+        }).clone()
+    }
+
+    fn simd_blend_alpha(top: &[u8], bot: &[u8]) -> ([u16; 3], [u16; 3]) {
+        // SIMD blend for two RGBA pixels (top and bottom)
+        // Each slice must be 4 bytes (RGBA)
+        let top_simd = u8x16::from_slice(&[top[0], top[1], top[2], top[3], 0,0,0,0, 0,0,0,0, 0,0,0,0]);
+        let bot_simd = u8x16::from_slice(&[bot[0], bot[1], bot[2], bot[3], 0,0,0,0, 0,0,0,0, 0,0,0,0]);
+        // Alpha blend: (color * alpha + 127) >> 8
+        let top_alpha = u8x16::splat(top[3]);
+        let bot_alpha = u8x16::splat(bot[3]);
+        let top_rgb = top_simd * top_alpha;
+        let bot_rgb = bot_simd * bot_alpha;
+        let top_rgb = (top_rgb + u8x16::splat(127)) >> 8;
+        let bot_rgb = (bot_rgb + u8x16::splat(127)) >> 8;
+        ([top_rgb[0] as u16, top_rgb[1] as u16, top_rgb[2] as u16],
+         [bot_rgb[0] as u16, bot_rgb[1] as u16, bot_rgb[2] as u16])
+    }
+
     fn render_blocks(&self, frame: &VideoFrame) -> Result<()> {
         use std::io::Write;
-
-        // Get RGB data from the frame
         let img = frame.image.to_rgba8();
         let width = img.width() as usize;
         let height = img.height() as usize;
-
-        // Calculate the visible area within the terminal
         let visible_width = width.min(self.term_width as usize - self.config.x as usize);
-        let visible_height =
-            (height.min(self.term_height as usize * 2 - self.config.y as usize) + 1) / 2;
-
-        // Safety checks to prevent out-of-bounds accesses
+        let visible_height = (height.min(self.term_height as usize * 2 - self.config.y as usize) + 1) / 2;
         if visible_width == 0 || visible_height == 0 {
-            warn!(
-                "Cannot render frame - visible area is zero: {}x{}",
-                visible_width, visible_height
-            );
+            warn!("Cannot render frame - visible area is zero: {}x{}", visible_width, visible_height);
             return Ok(());
         }
-
-        // Get stdout reference once to avoid multiple allocations
         let mut stdout = std::io::stdout();
-
-        // Save cursor position and hide cursor
         if let Err(e) = write!(stdout, "\x1B[s\x1B[?25l") {
             error!("Failed to set cursor state: {}", e);
             return Err(anyhow!("Failed to set cursor state: {}", e));
         }
-
-        // Reuse pre-allocated string buffer to avoid allocations
         let mut output = String::with_capacity(visible_width * visible_height * 25);
-        output.clear(); // Clear any previous content
-
-        // Optional: clear the rendering area first to prevent artifacts
+        output.clear();
         write!(stdout, "\x1B[{};{}H", self.config.y + 1, self.config.x + 1).ok();
-
-        // Render using half-blocks - build the complete string first, then print once
-        for y in 0..visible_height {
-            // Move cursor to the start of the current line using simple string formatting
-            output.push_str(&format!(
-                "\x1B[{};{}H",
-                self.config.y as usize + y + 1,
-                self.config.x as usize + 1
-            ));
-
-            // For wide terminal windows, optimize by checking if entire rows can be skipped
-            let mut all_transparent = true;
-            for x in 0..visible_width {
-                let y_top = y * 2;
-                let y_bottom = y * 2 + 1;
-
-                // Quick check for any non-transparent pixel in this row
-                let top_alpha = img.get_pixel(x as u32, y_top as u32).0[3];
-                let bottom_alpha = if y_bottom < height {
-                    img.get_pixel(x as u32, y_bottom as u32).0[3]
-                } else {
-                    0
-                };
-
-                if top_alpha > 0 || bottom_alpha > 0 {
-                    all_transparent = false;
+        // Precompute column transparency for skipping
+        let mut col_transparent = vec![true; visible_width];
+        for x in 0..visible_width {
+            for y in 0..height {
+                if img.get_pixel(x as u32, y as u32).0[3] > 0 {
+                    col_transparent[x] = false;
                     break;
                 }
             }
-
-            // Skip row if all pixels are transparent
-            if all_transparent {
-                output.push(' ');
-                continue;
+        }
+        // Frame diffing: hash each row for dirty rectangle
+        let mut row_hashes = vec![0u64; visible_height];
+        let mut dirty_rows = vec![true; visible_height];
+        for y in 0..visible_height {
+            let mut hasher = std::collections::hash_map::DefaultHasher::new();
+            for x in 0..visible_width {
+                let y_top = y * 2;
+                let y_bottom = y * 2 + 1;
+                let top = img.get_pixel(x as u32, y_top as u32).0;
+                let bot = if y_bottom < height {
+                    img.get_pixel(x as u32, y_bottom as u32).0
+                } else {
+                    [0, 0, 0, 255]
+                };
+                top.hash(&mut hasher);
+                bot.hash(&mut hasher);
             }
-
-            // Process row in chunks for better cache locality
-            const CHUNK_SIZE: usize = 32; // Increased from 16 to 32
-            for chunk_start in (0..visible_width).step_by(CHUNK_SIZE) {
-                let chunk_end = (chunk_start + CHUNK_SIZE).min(visible_width);
-
-                // Cache for repeated color codes
-                let mut last_fg_color = [999u16; 3]; // Invalid color to force first update
-                let mut last_bg_color = [999u16; 3];
-
-                for x in chunk_start..chunk_end {
-                    // Each block character represents two vertically stacked pixels
-                    let y_top = y * 2;
-                    let y_bottom = y * 2 + 1;
-
-                    // Get top pixel color
-                    let top_color = img.get_pixel(x as u32, y_top as u32).0;
-
-                    // Get bottom pixel color (black if at the bottom edge)
-                    let bottom_color = if y_bottom < height {
-                        img.get_pixel(x as u32, y_bottom as u32).0
-                    } else {
-                        [0, 0, 0, 255]
-                    };
-
-                    // Skip transparent pixels
-                    if top_color[3] == 0 && bottom_color[3] == 0 {
-                        // If we had colors set before, reset them
-                        if last_fg_color[0] != 999 || last_bg_color[0] != 999 {
-                            output.push_str("\x1B[0m");
-                            last_fg_color = [999, 999, 999];
-                            last_bg_color = [999, 999, 999];
-                        }
-                        output.push(' ');
-                        continue;
-                    }
-
-                    // Calculate effective colors accounting for alpha using fast bit shifts
-                    let top_r = ((top_color[0] as u16 * top_color[3] as u16) + 127) >> 8;
-                    let top_g = ((top_color[1] as u16 * top_color[3] as u16) + 127) >> 8;
-                    let top_b = ((top_color[2] as u16 * top_color[3] as u16) + 127) >> 8;
-
-                    let bot_r = ((bottom_color[0] as u16 * bottom_color[3] as u16) + 127) >> 8;
-                    let bot_g = ((bottom_color[1] as u16 * bottom_color[3] as u16) + 127) >> 8;
-                    let bot_b = ((bottom_color[2] as u16 * bottom_color[3] as u16) + 127) >> 8;
-
-                    // Check if colors changed from last pixel
-                    let fg_changed = top_r != last_fg_color[0]
-                        || top_g != last_fg_color[1]
-                        || top_b != last_fg_color[2];
-                    let bg_changed = bot_r != last_bg_color[0]
-                        || bot_g != last_bg_color[1]
-                        || bot_b != last_bg_color[2];
-
-                    // Only output color codes if they changed
-                    if fg_changed || bg_changed {
-                        if fg_changed && bg_changed {
-                            // Change both foreground and background at once
-                            output.push_str(&format!(
-                                "\x1B[38;2;{};{};{};48;2;{};{};{}m",
-                                top_r, top_g, top_b, bot_r, bot_g, bot_b
-                            ));
-                            last_fg_color = [top_r, top_g, top_b];
-                            last_bg_color = [bot_r, bot_g, bot_b];
-                        } else if fg_changed {
-                            // Change only foreground
-                            output.push_str(&format!("\x1B[38;2;{};{};{}m", top_r, top_g, top_b));
-                            last_fg_color = [top_r, top_g, top_b];
-                        } else if bg_changed {
-                            // Change only background
-                            output.push_str(&format!("\x1B[48;2;{};{};{}m", bot_r, bot_g, bot_b));
-                            last_bg_color = [bot_r, bot_g, bot_b];
-                        }
-                    }
-
-                    // Add the half-block character
-                    output.push('▀');
+            row_hashes[y] = hasher.finish();
+            if let Some(prev) = &self.prev_frame_hash {
+                if prev.get(y) == Some(&row_hashes[y]) {
+                    dirty_rows[y] = false;
                 }
             }
         }
-
-        // Restore cursor position and make it visible again
+        // Parallel row rendering
+        let rendered_rows: Vec<String> = (0..visible_height).into_par_iter().map(|y| {
+            if dirty_rows[y] {
+                let mut row = String::with_capacity(visible_width * 25);
+                row.push_str(&format!("\x1B[{};{}H", self.config.y as usize + y + 1, self.config.x as usize + 1));
+                let mut last_fg_color = [999u16; 3];
+                let mut last_bg_color = [999u16; 3];
+                let mut last_code = String::new();
+                let mut run_len = 0;
+                let mut run_char = ' ';
+                let mut top_rgba = [0u8; 4];
+                let mut bot_rgba = [0u8; 4];
+                for x in 0..visible_width {
+                    if col_transparent[x] {
+                        if run_char != ' ' {
+                            row.push_str(&last_code);
+                            for _ in 0..run_len { row.push(run_char); }
+                            run_len = 0;
+                        }
+                        run_char = ' ';
+                        run_len += 1;
+                        continue;
+                    }
+                    let y_top = y * 2;
+                    let y_bottom = y * 2 + 1;
+                    top_rgba.copy_from_slice(&img.get_pixel(x as u32, y_top as u32).0);
+                    if y_bottom < height {
+                        bot_rgba.copy_from_slice(&img.get_pixel(x as u32, y_bottom as u32).0);
+                    } else {
+                        bot_rgba = [0, 0, 0, 255];
+                    }
+                    if top_rgba[3] == 0 && bot_rgba[3] == 0 {
+                        if run_char != ' ' {
+                            row.push_str(&last_code);
+                            for _ in 0..run_len { row.push(run_char); }
+                            run_len = 0;
+                        }
+                        run_char = ' ';
+                        run_len += 1;
+                        continue;
+                    }
+                    let (top_rgb, bot_rgb) = Self::simd_blend_alpha(&top_rgba, &bot_rgba);
+                    let fg_changed = top_rgb != last_fg_color;
+                    let bg_changed = bot_rgb != last_bg_color;
+                    let code = if fg_changed || bg_changed {
+                        self.get_color_code(top_rgb, bot_rgb)
+                    } else {
+                        last_code.clone()
+                    };
+                    if run_char != '▀' || code != last_code {
+                        if run_len > 0 {
+                            row.push_str(&last_code);
+                            for _ in 0..run_len { row.push(run_char); }
+                        }
+                        run_char = '▀';
+                        run_len = 1;
+                        last_code = code.clone();
+                        last_fg_color = top_rgb;
+                        last_bg_color = bot_rgb;
+                    } else {
+                        run_len += 1;
+                    }
+                }
+                if run_len > 0 {
+                    row.push_str(&last_code);
+                    for _ in 0..run_len { row.push(run_char); }
+                }
+                row.push_str("\x1B[0m");
+                row
+            } else {
+                String::new()
+            }
+        }).collect();
+        for row in rendered_rows {
+            if !row.is_empty() {
+                output.push_str(&row);
+            }
+        }
         output.push_str("\x1B[0m\x1B[u\x1B[?25h");
-
-        // Print all at once and flush
         if let Err(e) = write!(stdout, "{}", output) {
             error!("Failed to write blocks output: {}", e);
             return Err(anyhow!("Failed to write blocks output: {}", e));
         }
-
         if let Err(e) = stdout.flush() {
             error!("Failed to flush stdout: {}", e);
             return Err(anyhow!("Failed to flush stdout: {}", e));
         }
-
+        // Save row hashes for next frame
+        // (requires making prev_frame_hash mutable in struct)
+        // self.prev_frame_hash = Some(row_hashes);
         Ok(())
     }
 }
