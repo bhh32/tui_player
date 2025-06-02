@@ -14,6 +14,8 @@ pub struct LocalMediaPlayer {
     last_frame_time: Instant,
     frame_duration: Duration,
     paused: bool,
+    audio_handle: Option<std::thread::JoinHandle<()>>,
+    audio_start: Option<Instant>,
 }
 
 impl LocalMediaPlayer {
@@ -21,14 +23,33 @@ impl LocalMediaPlayer {
     pub fn new<P: AsRef<Path>>(path: P, render_config: Option<RenderConfig>) -> Result<Self> {
         let path_buf = path.as_ref().to_path_buf();
         let decoder = VideoDecoder::new(&path_buf)?;
-
-        // Get media info to determine frame rate
         let info = decoder.get_media_info();
         let frame_duration = Duration::from_secs_f64(1. / info.frame_rate);
-
-        // Create renderer with provided config or default
         let render_config = render_config.unwrap_or_default();
         let renderer = TerminalRenderer::new(render_config)?;
+
+        // Extract audio to temp file and start playback
+        let audio_path = VideoDecoder::extract_audio_to_tempfile(&path_buf).ok();
+        let (audio_handle, audio_start) = if let Some(audio_path) = audio_path {
+            let audio_path = audio_path.clone();
+            let handle = std::thread::spawn(move || {
+                use rodio::{Decoder as RodioDecoder, OutputStream, Sink};
+                use std::fs::File;
+                use std::io::BufReader;
+                if let Ok((_stream, stream_handle)) = OutputStream::try_default() {
+                    if let Ok(file) = File::open(audio_path) {
+                        if let Ok(source) = RodioDecoder::new(BufReader::new(file)) {
+                            let sink = Sink::try_new(&stream_handle).unwrap();
+                            sink.append(source);
+                            sink.sleep_until_end();
+                        }
+                    }
+                }
+            });
+            (Some(handle), Some(Instant::now()))
+        } else {
+            (None, None)
+        };
 
         Ok(Self {
             decoder,
@@ -38,6 +59,8 @@ impl LocalMediaPlayer {
             last_frame_time: Instant::now(),
             frame_duration,
             paused: false,
+            audio_handle,
+            audio_start,
         })
     }
 
@@ -74,11 +97,18 @@ impl MediaPlayer for LocalMediaPlayer {
             return Ok(());
         }
 
-        let elapsed = self.last_frame_time.elapsed();
+        // Use audio clock for sync if available
+        let elapsed = if let Some(start) = self.audio_start {
+            start.elapsed()
+        } else {
+            self.last_frame_time.elapsed()
+        };
 
         // Check if it's time to render the next frame
         if elapsed >= self.frame_duration {
-            self.last_frame_time = Instant::now();
+            if self.audio_start.is_none() {
+                self.last_frame_time = Instant::now();
+            }
 
             // Decode and render the next frame
             if let Some(frame) = self.decoder.decode_next_frame()? {

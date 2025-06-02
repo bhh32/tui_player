@@ -30,6 +30,8 @@ pub struct VideoFrame {
     pub width: u32,
     /// Original frame height
     pub height: u32,
+    /// Optional path to audio file for this frame or segment
+    pub audio_path: Option<std::path::PathBuf>,
 }
 
 impl VideoFrame {
@@ -37,13 +39,13 @@ impl VideoFrame {
     pub fn new(image: DynamicImage, timestamp: f64, duration: f64) -> Self {
         let width = image.width();
         let height = image.height();
-
         Self {
             image,
             timestamp,
             duration,
             width,
             height,
+            audio_path: None,
         }
     }
 

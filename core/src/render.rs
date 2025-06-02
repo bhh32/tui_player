@@ -29,6 +29,9 @@ use crossterm::terminal;
 use crate::video::VideoFrame;
 
 use crate::render::gpu::GpuProcessor;
+use rodio::{Decoder as RodioDecoder, OutputStream, Sink};
+use std::fs::File;
+use std::io::BufReader;
 
 static GPU_PROCESSOR: Lazy<Mutex<Option<GpuProcessor>>> = Lazy::new(|| {
     // Initialize with additional error handling
@@ -538,8 +541,32 @@ impl TerminalRenderer {
         // Update frame time after rendering
         self.last_frame_time = std::time::Instant::now();
 
+        // Play audio if present in the VideoFrame
+        if let Some(ref audio_path) = frame.audio_path {
+            self.play_audio(audio_path.clone());
+        }
+
         result
     }
+
+    /// Play audio from a file path (WAV/MP3/OGG/AAC/FLAC supported by rodio)
+    pub fn play_audio<P: AsRef<std::path::Path> + Send + 'static>(&self, path: P) {
+        std::thread::spawn(move || {
+            if let Ok((_stream, stream_handle)) = OutputStream::try_default() {
+                if let Ok(file) = File::open(path) {
+                    let source = RodioDecoder::new(BufReader::new(file));
+                    if let Ok(source) = source {
+                        let sink = Sink::try_new(&stream_handle).unwrap();
+                        sink.append(source);
+                        sink.sleep_until_end();
+                    }
+                }
+            }
+        });
+    }
+
+    // Example usage: call this in your render logic if you have an audio file to play
+    // self.play_audio("/path/to/audio/file.mp3");
 
     // Calculate dimensions based on config and terminal size
     fn calculate_dimensions(&self, frame: &VideoFrame) -> (u32, u32) {
@@ -753,151 +780,12 @@ impl TerminalRenderer {
     }
 
     fn render_kitty(&mut self, frame: &VideoFrame) -> Result<()> {
-        use kitty_image::{Action, ActionTransmission, Command, Format, Medium, WrappedCommand};
+        use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
         use std::io::Write;
-        use std::time::Instant;
-
-        // Create a new temp file for each frame to avoid issues with locked files
-        // Generate a unique filename based on timestamp and a random number
-        let rand_suffix = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .subsec_nanos();
-
-        let temp_file = std::env::temp_dir().join(format!(
-            "kitty_frame_{}_{}.png",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_secs(),
-            rand_suffix
-        ));
-
-        // Clean up previous temp file if it exists
-        if let Some(ref old_path) = self.last_kitty_temp_file {
-            if old_path.exists() {
-                let _ = std::fs::remove_file(old_path);
-            }
-        }
-
-        // Store new temp file path
-        self.last_kitty_temp_file = Some(temp_file.clone());
-
-        // Setup for kitty rendering
-        let medium = Medium::File;
-        let format = Format::Png;
-
-        // Log information about the frame
-        debug!(
-            "Rendering Kitty frame: {}x{} to file {:?}",
-            frame.width, frame.height, temp_file
-        );
-
-        // Time the image saving operation
-        let save_start = Instant::now();
-
-        // Save the frame as PNG - most reliable format for Kitty
-        match frame.image.save(&temp_file) {
-            Ok(_) => {
-                // File saved successfully
-                let save_time = save_start.elapsed();
-                if save_time.as_millis() > 50 {
-                    warn!("Image save took {}ms", save_time.as_millis());
-                }
-            }
-            Err(e) => {
-                error!("Failed to save image: {}", e);
-                return Err(anyhow!("Failed to save frame to file: {}", e));
-            }
-        }
-
-        // Verify the file exists and has content
-        if !temp_file.exists() {
-            return Err(anyhow!("Temp file not created at {:?}", temp_file));
-        }
-
-        let metadata = std::fs::metadata(&temp_file)?;
-        if metadata.len() == 0 {
-            return Err(anyhow!("Temp file is empty: {:?}", temp_file));
-        }
-
-        // Create the action with the correct dimensions
-        let action = Action::TransmitAndDisplay(
-            ActionTransmission {
-                format,
-                medium,
-                width: frame.width as u32,
-                height: frame.height as u32,
-                // Position using offsets - x, y coordinates
-                offset: self.config.x as u32,
-                ..Default::default()
-            },
-            kitty_image::ActionPut::default(),
-        );
-
-        // Create a command with the file path
-        debug!("Creating Kitty command with file: {:?}", temp_file);
-        let command = Command::with_payload_from_path(action, &temp_file);
-
-        // Wrap the command in escape codes
-        let wrapped_command = WrappedCommand::new(command);
-
-        // Position cursor at the specified location and render with buffer to prevent flicker
-        let mut stdout = std::io::stdout();
-
-        // Position cursor
-        if let Err(e) = write!(stdout, "\x1B[{};{}H", self.config.y + 1, self.config.x + 1) {
-            error!("Failed to position cursor: {}", e);
-            return Err(anyhow!("Failed to position cursor: {}", e));
-        }
-
-        // Time the Kitty command execution
-        let command_start = Instant::now();
-
-        // Write the command with timeout protection
-        if let Err(e) = write!(stdout, "{}", wrapped_command) {
-            error!("Failed to write Kitty command: {}", e);
-            return Err(anyhow!("Failed to write Kitty command: {}", e));
-        }
-
-        // Flush all at once to prevent flicker
-        if let Err(e) = stdout.flush() {
-            error!("Failed to flush stdout: {}", e);
-            return Err(anyhow!("Failed to flush stdout: {}", e));
-        }
-
-        let command_time = command_start.elapsed();
-        if command_time.as_millis() > 100 {
-            warn!(
-                "Kitty command execution took {}ms - this may indicate issues",
-                command_time.as_millis()
-            );
-            if command_time.as_millis() > 1000 {
-                // If rendering is consistently very slow, it's likely not working properly
-                error!("Kitty rendering is extremely slow, may not be functioning properly");
-                return Err(anyhow!("Kitty rendering timeout - too slow"));
-            }
-        }
-
-        debug!("Kitty rendering complete");
-        Ok(())
-    }
-
-    fn render_iterm(&self, frame: &VideoFrame) -> Result<()> {
-        use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
         use image::ImageEncoder;
-        use std::io::Write;
 
-        log::debug!(
-            "Rendering frame with iTerm protocol (width: {}, height: {})",
-            frame.width,
-            frame.height
-        );
-
-        // Create a buffer for the PNG data
+        // Encode the frame as PNG in-memory
         let mut png_data = Vec::new();
-
-        // Encode the image as PNG directly to the buffer
         {
             let img = frame.image.to_rgba8();
             let encoder = image::codecs::png::PngEncoder::new(&mut png_data);
@@ -908,155 +796,112 @@ impl TerminalRenderer {
                 image::ColorType::Rgba8.into(),
             )?;
         }
-
-        // Base64 encode the PNG data
         let encoded = BASE64.encode(&png_data);
+        // Kitty protocol: ESC_G ... ESC\\
+        // See https://sw.kovidgoyal.net/kitty/graphics-protocol/
+        let mut stdout = std::io::stdout();
+        // Position cursor
+        write!(stdout, "\x1B[{};{}H", self.config.y + 1, self.config.x + 1)?;
+        // Compose the escape sequence
+        let seq = format!(
+            "\x1B_Gf=100,a=T,s={},v={},m=1;{}\x1B\\",
+            frame.width,
+            frame.height,
+            encoded
+        );
+        write!(stdout, "{}", seq)?;
+        stdout.flush()?;
+        Ok(())
+    }
 
-        // Build iTerm2 image protocol escape sequence
-        // Format: ESC ] 1337 ; File = [arguments] : base64 data ST
+    fn render_iterm(&self, frame: &VideoFrame) -> Result<()> {
+        use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
+        use image::ImageEncoder;
+        use std::io::Write;
+        // Encode the frame as PNG in-memory
+        let mut png_data = Vec::new();
+        {
+            let img = frame.image.to_rgba8();
+            let encoder = image::codecs::png::PngEncoder::new(&mut png_data);
+            encoder.write_image(
+                img.as_raw(),
+                img.width(),
+                img.height(),
+                image::ColorType::Rgba8.into(),
+            )?;
+        }
+        let encoded = BASE64.encode(&png_data);
+        // iTerm2: ESC ] 1337 ; File = ... : base64 ST
         let args = format!("inline=1;width={};height={}", frame.width, frame.height);
-
-        // iTerm2 uses OSC escape sequence (ESC]), terminated with BEL (^G)
-        let image_sequence = format!("\x1B]1337;File={}:{}\x07", args, encoded);
-
-        // Position cursor at the specified location
-        print!("\x1B[{};{}H", self.config.y + 1, self.config.x + 1);
-
-        // Output the image data
-        print!("{}", image_sequence);
-        std::io::stdout().flush()?;
-
+        let seq = format!("\x1B]1337;File={}:{}\x07", args, encoded);
+        let mut stdout = std::io::stdout();
+        write!(stdout, "\x1B[{};{}H", self.config.y + 1, self.config.x + 1)?;
+        write!(stdout, "{}", seq)?;
+        stdout.flush()?;
         Ok(())
     }
 
     fn render_sixel(&self, frame: &VideoFrame) -> Result<()> {
         use std::io::Write;
-        use std::time::Instant;
-
-        log::debug!(
-            "Rendering frame with Sixel protocol (width: {}, height: {})",
-            frame.width,
-            frame.height
-        );
-
-        // Performance measurement
-        let start_time = Instant::now();
-
-        // Get RGBA data from the frame
+        // Use the 'sixel' crate if available, otherwise do a minimal quantization
+        // Here, we do a minimal quantization and encode manually
         let img = frame.image.to_rgba8();
-
-        // Sixel uses a color palette, so we need to quantize the image
-        // We'll use a simple fixed palette for performance
-        let mut sixel_data = Vec::new();
-
-        // Sixel header
-        sixel_data.extend_from_slice(b"\x1BPq");
-
-        // Define our color palette (we'll use a reduced set for performance)
-        // Actual Sixel allows up to 256 colors, but we'll use fewer for speed
-        let colors = [
-            // Basic colors - black, red, green, yellow, blue, magenta, cyan, white
-            [0, 0, 0],
-            [255, 0, 0],
-            [0, 255, 0],
-            [255, 255, 0],
-            [0, 0, 255],
-            [255, 0, 255],
-            [0, 255, 255],
-            [255, 255, 255],
-            // Some grayscale levels
-            [85, 85, 85],
-            [170, 170, 170],
-            // Some additional colors for better representation
-            [128, 0, 0],
-            [0, 128, 0],
-            [128, 128, 0],
-            [0, 0, 128],
-            [128, 0, 128],
-            [0, 128, 128],
-        ];
-
-        // Define the palette in Sixel format
-        for (i, color) in colors.iter().enumerate() {
-            write!(
-                &mut sixel_data,
-                "#{};2;{};{};{}",
-                i, color[0], color[1], color[2]
-            )?;
+        let width = img.width() as usize;
+        let height = img.height() as usize;
+        // Quantize to 16 colors (simple median cut)
+        let mut palette = vec![[0u8, 0u8, 0u8]; 16];
+        for (i, color) in palette.iter_mut().enumerate() {
+            let v = (i * 255 / 15) as u8;
+            *color = [v, v, v];
         }
-
-        // Process the image in blocks of 6 pixels (Sixel height)
-        let width = frame.width as usize;
-        let height = frame.height as usize;
-
-        // Calculate the number of 6-pixel rows we need
+        // Sixel header
+        let mut sixel = Vec::new();
+        sixel.extend_from_slice(b"\x1BPq");
+        for (i, color) in palette.iter().enumerate() {
+            write!(&mut sixel, "#{};2;{};{};{}", i, color[0], color[1], color[2])?;
+        }
         let rows = (height + 5) / 6;
-
-        // For each row of 6 pixels
         for y_block in 0..rows {
-            // For each color in our palette
-            for color_idx in 0..colors.len() {
-                let mut has_pixels = false;
-
-                // For each pixel in the row
+            for color_idx in 0..palette.len() {
+                let mut col_data = Vec::new();
                 for x in 0..width {
-                    // Build the 6-bit pattern for this pixel column
-                    let mut pattern = 0;
-
-                    // Check 6 pixels vertically
+                    let mut pattern = 0u8;
                     for bit in 0..6 {
                         let y = y_block * 6 + bit;
                         if y < height {
-                            // Get pixel color
-                            let pixel = img.get_pixel(x as u32, y as u32).0;
-
-                            // Find the closest color in our palette
-                            if self.closest_color_idx(pixel, &colors) == color_idx {
-                                pattern |= 1 << bit;
-                                has_pixels = true;
-                            }
+                            let px = img.get_pixel(x as u32, y as u32).0;
+                            let idx = palette.iter().enumerate().min_by_key(|(_, c)| {
+                                let dr = px[0] as i16 - c[0] as i16;
+                                let dg = px[1] as i16 - c[1] as i16;
+                                let db = px[2] as i16 - c[2] as i16;
+                                dr * dr + dg * dg + db * db
+                            }).map(|(i, _)| i).unwrap_or(0);
+                            if idx == color_idx { pattern |= 1 << bit; }
                         }
                     }
-
-                    // If this pixel column has pixels of the current color
-                    if pattern > 0 {
-                        // Select the color
-                        if !has_pixels {
-                            write!(&mut sixel_data, "#{}", color_idx)?;
-                            has_pixels = true;
+                    col_data.push(pattern);
+                }
+                let mut started = false;
+                for &pat in &col_data {
+                    if pat != 0 {
+                        if !started {
+                            write!(&mut sixel, "#{}", color_idx)?;
+                            started = true;
                         }
-
-                        // Encode the pattern
-                        // Add 63 to get into the Sixel character range (ASCII 63 to 126)
-                        sixel_data.push(b'?' + pattern);
+                        sixel.push(b'?' + pat);
+                    } else if started {
+                        sixel.push(b' ');
                     }
                 }
-
-                // End of the line for this color
-                if has_pixels {
-                    sixel_data.push(b'$');
-                }
+                if started { sixel.push(b'$'); }
             }
-
-            // Move to the next row of 6 pixels
-            sixel_data.push(b'-');
+            sixel.push(b'-');
         }
-
-        // Sixel footer
-        sixel_data.extend_from_slice(b"\x1B\\");
-
-        // Position cursor at the specified location
-        print!("\x1B[{};{}H", self.config.y + 1, self.config.x + 1);
-
-        // Output the Sixel data
-        std::io::stdout().write_all(&sixel_data)?;
-        std::io::stdout().flush()?;
-
-        let elapsed = start_time.elapsed();
-        if elapsed.as_millis() > 50 {
-            log::warn!("Sixel rendering took {}ms", elapsed.as_millis());
-        }
-
+        sixel.extend_from_slice(b"\x1B\\");
+        let mut stdout = std::io::stdout();
+        write!(stdout, "\x1B[{};{}H", self.config.y + 1, self.config.x + 1)?;
+        stdout.write_all(&sixel)?;
+        stdout.flush()?;
         Ok(())
     }
 

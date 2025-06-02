@@ -33,3 +33,4 @@ wgpu = "25.0.2"
 youtube_dl = { version = "0.10.0", features = ["downloader-rustls-tls"] }
 async-std = "1.12.0"
 shared-mutex = "0.3"
+rodio = "0.17"

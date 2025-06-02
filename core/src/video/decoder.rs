@@ -3,6 +3,8 @@ use anyhow::{Context, Result, anyhow};
 use ffmpeg_next as ffmpeg;
 use image::{DynamicImage, RgbaImage};
 use std::path::Path;
+use std::process::Command;
+use tempfile::NamedTempFile;
 
 pub struct VideoDecoder {
     format_context: ffmpeg::format::context::Input,
@@ -268,6 +270,22 @@ impl VideoDecoder {
         self.next_pts = (timestamp_secs / self.time_base) as i64;
 
         Ok(())
+    }
+
+    /// Extract the audio stream to a temporary WAV file and return its path
+    pub fn extract_audio_to_tempfile<P: AsRef<Path>>(input_path: P) -> Result<std::path::PathBuf> {
+        // Create a temp file for the audio
+        let temp_file = NamedTempFile::new()?.into_temp_path();
+        let temp_path = temp_file.to_path_buf();
+        // Use ffmpeg CLI to extract audio as WAV (universal, no codec issues)
+        let status = Command::new("ffmpeg")
+            .args(&["-y", "-i", input_path.as_ref().to_str().unwrap(), "-vn", "-acodec", "pcm_s16le", temp_path.to_str().unwrap()])
+            .status()
+            .context("Failed to run ffmpeg to extract audio")?;
+        if !status.success() {
+            return Err(anyhow!("ffmpeg failed to extract audio"));
+        }
+        Ok(temp_path)
     }
 }
 
