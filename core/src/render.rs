@@ -406,7 +406,7 @@ impl TerminalRenderer {
         static mut SIXEL_FAILED: bool = false;
 
         // Determine which method to use, with better fallback handling
-        let current_method = unsafe {
+        let current_method = {
             // If any method has previously failed, avoid using it
             if KITTY_FAILED && self.effective_method == RenderMethod::Kitty {
                 debug!("Kitty previously failed, using Blocks instead");
@@ -457,7 +457,7 @@ impl TerminalRenderer {
                     Ok(Err(e)) => {
                         error!("Kitty rendering failed: {}", e);
                         warn!("Permanently falling back to blocks rendering");
-                        unsafe {
+                        {
                             KITTY_FAILED = true;
                             LAST_METHOD = Some(RenderMethod::Blocks);
                         }
@@ -469,7 +469,7 @@ impl TerminalRenderer {
                     Err(e) => {
                         error!("Kitty rendering panicked: {:?}", e);
                         warn!("Permanently falling back to blocks rendering");
-                        unsafe {
+                        {
                             KITTY_FAILED = true;
                             LAST_METHOD = Some(RenderMethod::Blocks);
                         }
@@ -486,7 +486,7 @@ impl TerminalRenderer {
                     Err(e) => {
                         error!("iTerm rendering failed: {}", e);
                         warn!("Permanently falling back to blocks rendering");
-                        unsafe {
+                        {
                             ITERM_FAILED = true;
                             LAST_METHOD = Some(RenderMethod::Blocks);
                         }
@@ -503,7 +503,7 @@ impl TerminalRenderer {
                     Err(e) => {
                         error!("Sixel rendering failed: {}", e);
                         warn!("Permanently falling back to blocks rendering");
-                        unsafe {
+                        {
                             SIXEL_FAILED = true;
                             LAST_METHOD = Some(RenderMethod::Blocks);
                         }
@@ -518,7 +518,7 @@ impl TerminalRenderer {
             RenderMethod::Auto => {
                 debug!("Using auto rendering method, defaulting to blocks");
                 let result = self.render_blocks(&resized_frame);
-                unsafe {
+                {
                     LAST_METHOD = Some(RenderMethod::Blocks);
                 }
                 result
@@ -527,7 +527,7 @@ impl TerminalRenderer {
 
         // Store the successful method for future frames
         if result.is_ok() {
-            unsafe {
+            {
                 LAST_METHOD = Some(current_method);
             }
         }
