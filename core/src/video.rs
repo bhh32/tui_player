@@ -53,6 +53,7 @@ impl VideoFrame {
     }
 
     /// Resize frame to target dimensions, maintaining aspect ratio if needed
+        #[inline]
         pub fn resize(
             &self,
             target_width: u32,
@@ -101,6 +102,7 @@ impl VideoFrame {
         }
 
     /// Create a new resized VideoFrame from pre-processed RGBA data
+    #[inline]
     pub fn resize_from_data(&self, width: u32, height: u32, data: Vec<u8>) -> Self {
         // Create the image directly from the raw data without additional allocations
         let rgba_image = image::RgbaImage::from_raw(width, height, data)
@@ -111,7 +113,6 @@ impl VideoFrame {
     }
     
     /// Check if the frame needs to be resized
-    #[inline]
     pub fn needs_resize(&self, target_width: u32, target_height: u32) -> bool {
         self.width != target_width || self.height != target_height
     }
@@ -123,6 +124,7 @@ impl VideoFrame {
     }
     
     /// Fast downscale for thumbnail or preview
+    #[inline]
     pub fn fast_thumbnail(&self, max_dimension: u32) -> Self {
         // If already small enough, return as is
         if self.max_dimension() <= max_dimension {
