@@ -346,7 +346,7 @@ fn draw_menu_bar(f: &mut Frame, app: &App, area: Rect) {
         inner_area
     );
     
-    let menu_items = vec!["File", "YouTube", "Settings", "Help"];
+    let menu_items = ["File", "YouTube", "Settings", "Help"];
     
     // Determine which tab to highlight based on current view
     let selected_tab = match app.view {
@@ -846,14 +846,14 @@ fn draw_settings_view(f: &mut Frame, app: &mut App, area: Rect) -> Result<()> {
         Line::from(vec![
             Span::styled("• Format: ", Style::default().fg(Color::Green)),
             Span::styled(
-                format!("{}", app.youtube_config.format.as_ref().unwrap_or(&"Auto".to_string())),
+                app.youtube_config.format.as_ref().unwrap_or(&"Auto".to_string()).to_string(),
                 Style::default().fg(Color::White)
             )
         ]),
         Line::from(vec![
             Span::styled("• Max Resolution: ", Style::default().fg(Color::Green)),
             Span::styled(
-                format!("{}", app.youtube_config.max_resolution.as_ref().unwrap_or(&"Auto".to_string())),
+                app.youtube_config.max_resolution.as_ref().unwrap_or(&"Auto".to_string()).to_string(),
                 Style::default().fg(Color::White)
             )
         ]),
@@ -1102,14 +1102,14 @@ fn draw_settings_dialog(f: &mut Frame, app: &App) {
         Line::from(vec![
             Span::styled("6. Format: ", Style::default().fg(Color::Green)),
             Span::styled(
-                format!("{}", app.youtube_config.format.as_ref().unwrap_or(&"Auto".to_string())), 
+                app.youtube_config.format.as_ref().unwrap_or(&"Auto".to_string()).to_string(), 
                 Style::default().fg(Color::White)
             )
         ]),
         Line::from(vec![
             Span::styled("7. Max Resolution: ", Style::default().fg(Color::Green)),
             Span::styled(
-                format!("{}", app.youtube_config.max_resolution.as_ref().unwrap_or(&"Auto".to_string())), 
+                app.youtube_config.max_resolution.as_ref().unwrap_or(&"Auto".to_string()).to_string(), 
                 Style::default().fg(Color::White)
             )
         ]),
