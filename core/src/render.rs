@@ -9,7 +9,6 @@
 // - render_blocks: skips fully transparent columns, parallelizes row rendering, minimizes ANSI output, and only redraws dirty rows
 //
 // See tests in tests.rs for coverage of these features.
-use core::simd::u8x16; // SIMD for pixel math
 mod gpu;
 #[cfg(test)]
 mod tests;
@@ -19,7 +18,9 @@ use once_cell::sync::Lazy;
 use parking_lot::Mutex;
 use rayon::prelude::*;
 use std::collections::HashMap;
+use std::hash::{Hash, Hasher};
 use std::io::Write;
+use std::sync::Mutex as StdMutex;
 use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow};
@@ -418,24 +419,25 @@ impl TerminalRenderer {
         // Don't flush here - we'll flush after rendering
 
         // Track previous method for fallback mechanics
-        static mut LAST_METHOD: Option<RenderMethod> = None;
-        static mut KITTY_FAILED: bool = false;
-        static mut ITERM_FAILED: bool = false;
-        static mut SIXEL_FAILED: bool = false;
+        // Replace static mut fallback state with safe statics
+        static LAST_METHOD: Lazy<StdMutex<Option<RenderMethod>>> = Lazy::new(|| StdMutex::new(None));
+        static KITTY_FAILED: Lazy<StdMutex<bool>> = Lazy::new(|| StdMutex::new(false));
+        static ITERM_FAILED: Lazy<StdMutex<bool>> = Lazy::new(|| StdMutex::new(false));
+        static SIXEL_FAILED: Lazy<StdMutex<bool>> = Lazy::new(|| StdMutex::new(false));
 
         // Determine which method to use, with better fallback handling
         let current_method = {
             // If any method has previously failed, avoid using it
-            if KITTY_FAILED && self.effective_method == RenderMethod::Kitty {
+            if *KITTY_FAILED.lock().unwrap() && self.effective_method == RenderMethod::Kitty {
                 debug!("Kitty previously failed, using Blocks instead");
                 RenderMethod::Blocks
-            } else if ITERM_FAILED && self.effective_method == RenderMethod::ITerm {
+            } else if *ITERM_FAILED.lock().unwrap() && self.effective_method == RenderMethod::ITerm {
                 debug!("iTerm previously failed, using Blocks instead");
                 RenderMethod::Blocks
-            } else if SIXEL_FAILED && self.effective_method == RenderMethod::Sixel {
+            } else if *SIXEL_FAILED.lock().unwrap() && self.effective_method == RenderMethod::Sixel {
                 debug!("Sixel previously failed, using Blocks instead");
                 RenderMethod::Blocks
-            } else if let Some(method) = LAST_METHOD {
+            } else if let Some(method) = *LAST_METHOD.lock().unwrap() {
                 if method != RenderMethod::Auto {
                     method
                 } else {
@@ -449,7 +451,6 @@ impl TerminalRenderer {
         // Render based on the effective method with timeout protection
         let result = match current_method {
             RenderMethod::Kitty => {
-                // Add timeout protection for Kitty rendering
                 let kitty_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     // Use a timeout for Kitty rendering
                     let kitty_timeout = std::time::Duration::from_millis(2000);
@@ -475,11 +476,8 @@ impl TerminalRenderer {
                     Ok(Err(e)) => {
                         error!("Kitty rendering failed: {}", e);
                         warn!("Permanently falling back to blocks rendering");
-                        {
-                            KITTY_FAILED = true;
-                            LAST_METHOD = Some(RenderMethod::Blocks);
-                        }
-                        // Try to clear any partial output first
+                        *KITTY_FAILED.lock().unwrap() = true;
+                        *LAST_METHOD.lock().unwrap() = Some(RenderMethod::Blocks);
                         let _ = write!(std::io::stdout(), "\x1B[2J\x1B[H");
                         std::io::stdout().flush().ok();
                         self.render_blocks(&resized_frame)
@@ -487,11 +485,8 @@ impl TerminalRenderer {
                     Err(e) => {
                         error!("Kitty rendering panicked: {:?}", e);
                         warn!("Permanently falling back to blocks rendering");
-                        {
-                            KITTY_FAILED = true;
-                            LAST_METHOD = Some(RenderMethod::Blocks);
-                        }
-                        // Try to clear any partial output first
+                        *KITTY_FAILED.lock().unwrap() = true;
+                        *LAST_METHOD.lock().unwrap() = Some(RenderMethod::Blocks);
                         let _ = write!(std::io::stdout(), "\x1B[2J\x1B[H");
                         std::io::stdout().flush().ok();
                         self.render_blocks(&resized_frame)
@@ -504,11 +499,8 @@ impl TerminalRenderer {
                     Err(e) => {
                         error!("iTerm rendering failed: {}", e);
                         warn!("Permanently falling back to blocks rendering");
-                        {
-                            ITERM_FAILED = true;
-                            LAST_METHOD = Some(RenderMethod::Blocks);
-                        }
-                        // Try to clear any partial output first
+                        *ITERM_FAILED.lock().unwrap() = true;
+                        *LAST_METHOD.lock().unwrap() = Some(RenderMethod::Blocks);
                         let _ = write!(std::io::stdout(), "\x1B[2J\x1B[H");
                         std::io::stdout().flush().ok();
                         self.render_blocks(&resized_frame)
@@ -521,11 +513,8 @@ impl TerminalRenderer {
                     Err(e) => {
                         error!("Sixel rendering failed: {}", e);
                         warn!("Permanently falling back to blocks rendering");
-                        {
-                            SIXEL_FAILED = true;
-                            LAST_METHOD = Some(RenderMethod::Blocks);
-                        }
-                        // Try to clear any partial output first
+                        *SIXEL_FAILED.lock().unwrap() = true;
+                        *LAST_METHOD.lock().unwrap() = Some(RenderMethod::Blocks);
                         let _ = write!(std::io::stdout(), "\x1B[2J\x1B[H");
                         std::io::stdout().flush().ok();
                         self.render_blocks(&resized_frame)
@@ -536,18 +525,14 @@ impl TerminalRenderer {
             RenderMethod::Auto => {
                 debug!("Using auto rendering method, defaulting to blocks");
                 let result = self.render_blocks(&resized_frame);
-                {
-                    LAST_METHOD = Some(RenderMethod::Blocks);
-                }
+                *LAST_METHOD.lock().unwrap() = Some(RenderMethod::Blocks);
                 result
             }
         };
 
         // Store the successful method for future frames
         if result.is_ok() {
-            {
-                LAST_METHOD = Some(current_method);
-            }
+            *LAST_METHOD.lock().unwrap() = Some(current_method);
         }
 
         // Update frame time after rendering
@@ -1119,22 +1104,20 @@ impl TerminalRenderer {
     }
 
     fn simd_blend_alpha(top: &[u8], bot: &[u8]) -> ([u16; 3], [u16; 3]) {
-        // SIMD blend for two RGBA pixels (top and bottom)
+        // Stable, non-SIMD alpha blending for two RGBA pixels
         // Each slice must be 4 bytes (RGBA)
-        let top_simd = u8x16::from_slice(&[top[0], top[1], top[2], top[3], 0,0,0,0, 0,0,0,0, 0,0,0,0]);
-        let bot_simd = u8x16::from_slice(&[bot[0], bot[1], bot[2], bot[3], 0,0,0,0, 0,0,0,0, 0,0,0,0]);
-        // Alpha blend: (color * alpha + 127) >> 8
-        let top_alpha = u8x16::splat(top[3]);
-        let bot_alpha = u8x16::splat(bot[3]);
-        let top_rgb = top_simd * top_alpha;
-        let bot_rgb = bot_simd * bot_alpha;
-        let top_rgb = (top_rgb + u8x16::splat(127)) >> 8;
-        let bot_rgb = (bot_rgb + u8x16::splat(127)) >> 8;
-        ([top_rgb[0] as u16, top_rgb[1] as u16, top_rgb[2] as u16],
-         [bot_rgb[0] as u16, bot_rgb[1] as u16, bot_rgb[2] as u16])
+        let blend = |fg: &[u8; 4], bg: &[u8; 4]| -> [u16; 3] {
+            let a = fg[3] as u16;
+            let r = (fg[0] as u16 * a + bg[0] as u16 * (255 - a)) / 255;
+            let g = (fg[1] as u16 * a + bg[1] as u16 * (255 - a)) / 255;
+            let b = (fg[2] as u16 * a + bg[2] as u16 * (255 - a)) / 255;
+            [r, g, b]
+        };
+        ([blend(&top.try_into().unwrap(), &[0,0,0,255]), blend(&bot.try_into().unwrap(), &[0,0,0,255])][0],
+         [blend(&bot.try_into().unwrap(), &[0,0,0,255])][0])
     }
 
-    fn render_blocks(&self, frame: &VideoFrame) -> Result<()> {
+    fn render_blocks(&mut self, frame: &VideoFrame) -> Result<()> {
         use std::io::Write;
         let img = frame.image.to_rgba8();
         let width = img.width() as usize;
@@ -1275,8 +1258,7 @@ impl TerminalRenderer {
             return Err(anyhow!("Failed to flush stdout: {}", e));
         }
         // Save row hashes for next frame
-        // (requires making prev_frame_hash mutable in struct)
-        // self.prev_frame_hash = Some(row_hashes);
+        self.prev_frame_hash = Some(row_hashes);
         Ok(())
     }
 }

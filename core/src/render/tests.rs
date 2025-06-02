@@ -8,6 +8,7 @@ use crate::render::gpu::GpuProcessor;
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::hash::{Hash, Hasher};
 
     /// Generate a test frame with the given dimensions
     fn create_test_frame(width: u32, height: u32) -> VideoFrame {
