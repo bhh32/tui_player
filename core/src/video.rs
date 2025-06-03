@@ -4,6 +4,7 @@ pub mod frame;
 use anyhow::{Context, Result};
 use ffmpeg_next as ffmpeg;
 use image::DynamicImage;
+pub use frame::FrameBuffer;
 
 // Initialize FFmpeg only once
 pub fn init() -> Result<()> {

@@ -8,6 +8,7 @@ use youtube_dl::{YoutubeDl, YoutubeDlOutput};
 
 use crate::render::{RenderConfig, TerminalRenderer};
 use crate::{MediaInfo, MediaPlayer, VideoDecoder};
+use std::any::Any;
 
 /// Configuration for YouTube streaming
 #[derive(Clone)]
@@ -375,6 +376,34 @@ impl MediaPlayer for YouTubePlayer {
 
     /// Update player state and render the next frame if needed
     fn update(&mut self) -> Result<()> {
+        // CRUCIAL FIX: Handle paused state first
+        if self.paused {
+            debug!("YouTube player is paused - rendering current frame");
+            
+            // Get decoder if available
+            if let Some(decoder) = &mut self.decoder {
+                // Get the current frame at the paused position
+                match decoder.decode_current_frame() {
+                    Ok(Some(mut frame)) => {
+                        // Mark this as a paused frame with negative timestamp
+                        frame.timestamp = -1.0;
+                        self.renderer.render(&frame)?;
+                        debug!("Rendered paused YouTube frame at position: {:.2}s", self.current_timestamp);
+                    }
+                    Ok(None) => {
+                        debug!("No YouTube frame available at paused position");
+                    }
+                    Err(e) => {
+                        warn!("Error getting paused YouTube frame: {}", e);
+                    }
+                }
+            }
+            
+            // Sleep a bit to reduce CPU usage when paused
+            std::thread::sleep(Duration::from_millis(100));
+            return Ok(());
+        }
+    
         // Initialize if not already done with timeout protection
         if self.decoder.is_none() {
             // Use a timeout to prevent initialization from hanging
@@ -400,10 +429,6 @@ impl MediaPlayer for YouTubePlayer {
                     return Err(anyhow!("YouTube player initialization failed unexpectedly"));
                 }
             }
-        }
-
-        if self.paused {
-            return Ok(());
         }
 
         let elapsed = self.last_frame_time.elapsed();
@@ -455,24 +480,55 @@ impl MediaPlayer for YouTubePlayer {
 
     /// Pause or resume playback
     fn toggle_pause(&mut self) {
+        // CRUCIAL FIX: Toggle pause state with prominent logging
         self.paused = !self.paused;
+        log::warn!("YOUTUBE PLAYER: Playback paused state changed to: {}", self.paused);
         self.last_frame_time = Instant::now(); // Reset frame timing
     }
 
     /// Seek to a specific time in seconds
     fn seek(&mut self, timestamp_secs: f64) -> Result<()> {
+        // CRUCIAL FIX: Log seek action prominently
+        log::warn!("YOUTUBE PLAYER: Seeking to {:.2}s", timestamp_secs);
+        
         if let Some(decoder) = &mut self.decoder {
-            decoder.seek(timestamp_secs)?;
+            // Ensure seek operation completes
+            let seek_result = decoder.seek(timestamp_secs);
+            if let Err(ref e) = seek_result {
+                log::warn!("YOUTUBE PLAYER: Seek failed: {}", e);
+                return seek_result;
+            }
+            
+            // Update state
             self.current_timestamp = timestamp_secs;
             self.last_frame_time = Instant::now(); // Reset frame timing
 
-            // Immediately decode and display a frame at the new position
-            if let Some(frame) = decoder.decode_next_frame()? {
-                self.renderer.render(&frame)?;
+            // Force immediate frame update after seek
+            log::warn!("YOUTUBE PLAYER: Decoding frame at new position");
+            match decoder.decode_next_frame() {
+                Ok(Some(frame)) => {
+                    log::warn!("YOUTUBE PLAYER: Rendering frame at new position");
+                    self.current_timestamp = frame.timestamp;
+                    self.renderer.render(&frame)?;
+                }
+                Ok(None) => {
+                    log::warn!("YOUTUBE PLAYER: No frame at seek position (EOF)");
+                }
+                Err(e) => {
+                    log::warn!("YOUTUBE PLAYER: Error decoding frame after seek: {}", e);
+                    return Err(e);
+                }
             }
+        } else {
+            log::warn!("YOUTUBE PLAYER: Cannot seek - decoder not initialized");
+            return Err(anyhow!("Cannot seek - decoder not initialized"));
         }
 
         Ok(())
+    }
+    
+    fn as_any(&self) -> &dyn Any {
+        self
     }
 }
 

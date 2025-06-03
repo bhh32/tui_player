@@ -95,27 +95,26 @@ impl CommandHandler {
                         app.youtube_search.searching = true;
                         app.set_status(format!("Searching for '{}'...", query), ratatui::style::Color::Yellow);
                         
-                        // Add mock results (in a real app, this would call the YouTube API)
+                        // Use the app's internal search mechanism (real YouTube search)
+                        app.youtube_search.query = query.to_string();
+                        app.youtube_search.searching = true;
+                        
+                        // This will trigger the actual search in the background
+                        // Results will be populated by the app's update method
+                        app.set_status(format!("Searching YouTube for '{}'...", query), 
+                                     ratatui::style::Color::Yellow);
+                        
+                        // Add a loading placeholder
                         app.youtube_search.results.push(crate::app::YoutubeResult {
-                            id: "dQw4w9WgXcQ".to_string(),
-                            title: format!("Search result 1 for '{}'", query),
-                            duration: "3:32".to_string(),
+                            id: "loading".to_string(),
+                            title: "Searching YouTube...".to_string(),
+                            duration: "".to_string(),
                             thumbnail: None,
-                            channel: "Example Channel".to_string(),
+                            downloaded_thumbnail: None,
+                            channel: "Please wait".to_string(),
                         });
                         
-                        app.youtube_search.results.push(crate::app::YoutubeResult {
-                            id: "xvFZjo5PgG0".to_string(),
-                            title: format!("Search result 2 for '{}'", query),
-                            duration: "4:20".to_string(),
-                            thumbnail: None,
-                            channel: "Another Channel".to_string(),
-                        });
-                        
-                        app.youtube_search.searching = false;
                         app.youtube_search.selected = Some(0);
-                        app.set_status(format!("Found {} results for '{}'", app.youtube_search.results.len(), query), 
-                                      ratatui::style::Color::Green);
                     }
                 } else {
                     app.view = crate::app::AppView::YoutubeSearch;

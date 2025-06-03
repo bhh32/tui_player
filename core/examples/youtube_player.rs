@@ -2,7 +2,7 @@ use anyhow::{Context, Result};
 use std::{env, io::Write, thread, time::Duration};
 
 use core::{
-    detect_media_type, MediaSourceType, YouTubePlayer, YouTubeConfig, MediaPlayer,
+    MediaPlayer, MediaSourceType, YouTubeConfig, YouTubePlayer, detect_media_type,
     render::{RenderConfig, RenderMethod},
 };
 
@@ -23,8 +23,8 @@ fn main() -> Result<()> {
         return Ok(());
     }
 
-    let url_or_id = &args[1];
-    
+    let url_or_id = "https://www.youtube.com/watch?v=YBxx29AkzlA";
+
     // Check if yt-dlp is installed
     if let Err(_status) = std::process::Command::new("yt-dlp")
         .arg("--version")
@@ -36,7 +36,9 @@ fn main() -> Result<()> {
         eprintln!("\nFor Debian/Ubuntu:");
         eprintln!("    sudo apt-get install yt-dlp");
         eprintln!("    # If not available in your repository:");
-        eprintln!("    sudo curl -L https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp -o /usr/local/bin/yt-dlp");
+        eprintln!(
+            "    sudo curl -L https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp -o /usr/local/bin/yt-dlp"
+        );
         eprintln!("    sudo chmod a+rx /usr/local/bin/yt-dlp");
         eprintln!("\nFor macOS:");
         eprintln!("    brew install yt-dlp");
@@ -44,12 +46,14 @@ fn main() -> Result<()> {
         eprintln!("    pip install yt-dlp");
         return Ok(());
     }
-    
+
     // Detect media type
     let media_type = detect_media_type(url_or_id);
     if media_type != MediaSourceType::YouTube && url_or_id.len() != 11 {
         eprintln!("Error: Not a valid YouTube URL or ID: {}", url_or_id);
-        eprintln!("Please provide a YouTube URL (e.g., https://www.youtube.com/watch?v=dQw4w9WgXcQ)");
+        eprintln!(
+            "Please provide a YouTube URL (e.g., https://www.youtube.com/watch?v=dQw4w9WgXcQ)"
+        );
         eprintln!("Or a YouTube video ID (e.g., dQw4w9WgXcQ)");
         return Ok(());
     }
@@ -62,31 +66,32 @@ fn main() -> Result<()> {
 
     // Configure the YouTube player with yt-dlp
     let youtube_config = YouTubeConfig {
-        quality: 1,                         // 0 is best, higher numbers are lower quality
-        format: Some("mp4".to_string()),    // Prefer MP4 format
+        quality: 1,                               // 0 is best, higher numbers are lower quality
+        format: Some("mp4".to_string()),          // Prefer MP4 format
         max_resolution: Some("720p".to_string()), // Limit resolution for better performance
-        ytdlp_path: None,                   // Auto-detect yt-dlp path
+        ytdlp_path: None,                         // Auto-detect yt-dlp path
         ..Default::default()
     };
 
     // Configure the renderer
     let render_config = RenderConfig {
-        method: RenderMethod::Auto,         // Auto-detect best rendering method
-        width: Some(120),                   // Adjust width as needed
-        height: Some(60),                   // Adjust height as needed
+        method: RenderMethod::Auto, // Auto-detect best rendering method
+        width: Some(120),           // Adjust width as needed
+        height: Some(60),           // Adjust height as needed
         maintain_aspect: true,
         x: 0,
-        y: 2,                              // Leave space for the status line
-        adaptive_resolution: true,         // Enable adaptive resolution
-        quality: 0.8,                      // Start with good quality
-        target_fps: 30.0,                  // Target 30 FPS
+        y: 2,                      // Leave space for the status line
+        adaptive_resolution: true, // Enable adaptive resolution
+        quality: 0.8,              // Start with good quality
+        target_fps: 30.0,          // Target 30 FPS
         enable_threading: true,
         max_frame_dimension: Some(1024),
-        enable_gpu: true,                  // Use GPU acceleration if available
+        enable_gpu: true, // Use GPU acceleration if available
     };
 
     // Create a YouTube player
-    let mut player = match YouTubePlayer::new(url_or_id, Some(render_config), Some(youtube_config)) {
+    let mut player = match YouTubePlayer::new(url_or_id, Some(render_config), Some(youtube_config))
+    {
         Ok(p) => p,
         Err(e) => {
             eprintln!("Failed to create YouTube player: {}", e);
@@ -107,7 +112,7 @@ fn main() -> Result<()> {
     if let Err(e) = player.initialize() {
         // Clear screen to show error clearly
         print!("\x1B[2J\x1B[1;1H");
-        
+
         eprintln!("Error initializing YouTube player:");
         eprintln!("{:?}", e);
         eprintln!("\nPossible solutions:");
@@ -120,10 +125,12 @@ fn main() -> Result<()> {
     }
 
     // Get video info
-    let media_info = player.get_media_info()
+    let media_info = player
+        .get_media_info()
         .context("Failed to get media info")?;
-    
-    let youtube_info = player.get_youtube_info()
+
+    let youtube_info = player
+        .get_youtube_info()
         .context("Failed to get YouTube info")?;
 
     println!("\x1B[2J\x1B[1;1H"); // Clear screen again
@@ -154,11 +161,16 @@ fn main() -> Result<()> {
 
         // Update status line every 100ms
         if last_status_update.elapsed() >= Duration::from_millis(100) {
-            print!("\x1B[1;1HPosition: {:.2}/{:.2}s | FPS: {:.1} | {} | Press 'q' to quit, space to pause/resume, left/right arrows to seek",
+            print!(
+                "\x1B[1;1HPosition: {:.2}/{:.2}s | FPS: {:.1} | {} | Press 'q' to quit, space to pause/resume, left/right arrows to seek",
                 player.get_position(),
                 media_info.duration,
                 1.0 / frame_duration.as_secs_f64(),
-                if player.is_paused() { "PAUSED" } else { "PLAYING" }
+                if player.is_paused() {
+                    "PAUSED"
+                } else {
+                    "PLAYING"
+                }
             );
             std::io::stdout().flush()?;
             last_status_update = std::time::Instant::now();
@@ -199,7 +211,7 @@ fn main() -> Result<()> {
     if let Err(e) = terminal::disable_raw_mode() {
         eprintln!("Warning: Failed to disable raw mode: {}", e);
     }
-    
+
     if let Err(e) = execute!(std::io::stdout(), LeaveAlternateScreen) {
         eprintln!("Warning: Failed to leave alternate screen: {}", e);
     }

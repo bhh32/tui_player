@@ -2815,8 +2815,13 @@ dependencies = [
  "notify",
  "once_cell",
  "ratatui 0.29.0",
+ "reqwest",
+ "serde",
+ "serde_json",
  "tokio",
  "tui-widget-list",
+ "unicode-width 0.2.0",
+ "youtube_dl",
 ]
 
 [[package]]
@@ -3302,6 +3307,7 @@ dependencies = [
  "base64 0.22.1",
  "bytes",
  "encoding_rs",
+ "futures-channel",
  "futures-core",
  "futures-util",
  "h2",

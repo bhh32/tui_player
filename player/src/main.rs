@@ -54,8 +54,7 @@ fn main() -> Result<()> {
         let mut stdout = io::stdout();
         let _ = execute!(
             stdout,
-            LeaveAlternateScreen,
-            DisableMouseCapture
+            LeaveAlternateScreen
         );
         
         // Log the panic
@@ -75,10 +74,15 @@ fn main() -> Result<()> {
     }
     
     let mut stdout = io::stdout();
+    
+    // Clear the screen first to prevent artifacts
+    if let Err(e) = execute!(stdout, crossterm::terminal::Clear(crossterm::terminal::ClearType::All)) {
+        debug_log(&format!("Failed to clear screen: {}", e));
+    }
+    
     if let Err(e) = execute!(
         stdout,
-        EnterAlternateScreen,
-        EnableMouseCapture
+        EnterAlternateScreen
     ) {
         let _ = disable_raw_mode();
         debug_log(&format!("Failed to setup terminal: {}", e));
@@ -100,7 +104,13 @@ fn main() -> Result<()> {
     
     // Create app state and initialize
     let mut app = App::new();
-    debug_log("App initialized");
+    
+    // Start with mouse capture disabled to prevent escape sequences
+    let _ = execute!(
+        terminal.backend_mut(),
+        DisableMouseCapture
+    );
+    debug_log("App initialized with mouse capture disabled");
     
     // If a command line argument is provided, try to open it
     let args: Vec<String> = std::env::args().collect();
@@ -115,6 +125,17 @@ fn main() -> Result<()> {
         } else {
             debug_log("Media opened successfully");
             app.set_status("Media loaded successfully", Color::Green);
+                        
+            // If we're loading directly into player view, ensure mouse capture is disabled
+            // and terminal is cleared
+            if app.view == app::AppView::Player {
+                let _ = execute!(
+                    terminal.backend_mut(),
+                    DisableMouseCapture,
+                    crossterm::terminal::Clear(crossterm::terminal::ClearType::All)
+                );
+                debug_log("Terminal cleared and mouse capture disabled for direct video playback");
+            }
         }
     }
     
@@ -141,6 +162,7 @@ fn main() -> Result<()> {
             // Draw the UI without clearing first to prevent flickering
             let draw_start = Instant::now();
             if let Err(e) = terminal.draw(|f| {
+                // Use the CrosstermBackend explicitly to match our terminal backend
                 match ui::draw_ui(f, &mut app) {
                     Ok(_) => {},
                     Err(e) => {
@@ -185,15 +207,14 @@ fn main() -> Result<()> {
             match event::read() {
                 Ok(Event::Key(key)) => {
                     debug_log(&format!("EVENT: Key {:?} with modifiers {:?}", key.code, key.modifiers));
-                    
-                    // Check for global quit key (Ctrl+C or Ctrl+Q)
-                    if (key.code == event::KeyCode::Char('c') || key.code == event::KeyCode::Char('q')) 
-                        && key.modifiers.contains(event::KeyModifiers::CONTROL) {
+                            
+                    // Check for global quit key using utility function
+                    if events::event_utils::is_terminate_event(&Event::Key(key)) {
                         debug_log("ACTION: Quit key pressed, exiting application");
                         app.should_quit = true;
                         break;
                     }
-                    
+                            
                     // Check for command mode (press ':')
                     if key.code == event::KeyCode::Char(':') && !app.is_command_mode() {
                         debug_log("Entering command mode");
@@ -203,7 +224,7 @@ fn main() -> Result<()> {
                         let cmd = app.get_command_buffer().to_string();
                         debug_log(&format!("Executing command: {}", cmd));
                         app.exit_command_mode();
-                        
+                                
                         if let Err(e) = commands::handle_command(&mut app, &cmd) {
                             debug_log(&format!("Command error: {}", e));
                             app.set_status(format!("Error: {}", e), Color::Red);
@@ -216,15 +237,49 @@ fn main() -> Result<()> {
                             debug_log(&format!("Key handler error: {}", e));
                             app.set_status(format!("Key error: {}", e), Color::Red);
                         }
+                                
+                        // Ensure mouse state is always updated after key events that might change app view
+                        if key.code == event::KeyCode::Esc || 
+                           key.code == event::KeyCode::Char(' ') ||
+                           key.code == event::KeyCode::Char('o') ||
+                           key.code == event::KeyCode::Char('y') {
+                            // Clear the terminal to prevent artifacts during view transitions
+                            let _ = execute!(
+                                terminal.backend_mut(),
+                                crossterm::terminal::Clear(crossterm::terminal::ClearType::All)
+                            );
+                            
+                            // Update mouse state based on current view
+                            if app.view == app::AppView::Player {
+                                // Always disable mouse capture during video playback
+                                let _ = execute!(
+                                    terminal.backend_mut(),
+                                    DisableMouseCapture
+                                );
+                                debug_log("Cleared terminal and disabled mouse capture for playback");
+                            } else {
+                                // Re-enable mouse capture for UI interaction
+                                let _ = execute!(
+                                    terminal.backend_mut(),
+                                    EnableMouseCapture
+                                );
+                                debug_log("Cleared terminal and enabled mouse capture for UI");
+                            }
+                        }
                     }
                 }
                 Ok(Event::Mouse(mouse)) => {
-                    let area = terminal.get_frame().area();
-                    debug_log(&format!("EVENT: Mouse {:?} at col={} row={} in area {}x{}", 
-                                     mouse.kind, mouse.column, mouse.row, area.width, area.height));
-                    if let Err(e) = app.handle_mouse_event(mouse, area) {
-                        debug_log(&format!("ERROR: Mouse handler error: {}", e));
-                        app.set_status(format!("Mouse error: {}", e), Color::Red);
+                    // Handle navigation-related mouse events
+                    let is_nav_event = events::event_utils::is_navigation_event(&Event::Mouse(mouse));
+                    // For playback view, disable mouse and clear artifacts
+                    if app.view == app::AppView::Player {
+                        // Make sure mouse remains disabled for player view and clear any artifacts
+                        let _ = execute!(
+                            terminal.backend_mut(),
+                            DisableMouseCapture,
+                            crossterm::terminal::Clear(crossterm::terminal::ClearType::All)
+                        );
+                        debug_log(&format!("Mouse event received (navigation: {}) - cleared terminal and disabled mouse", is_nav_event));
                     }
                 }
                 Ok(Event::Resize(w, h)) => {
@@ -278,9 +333,41 @@ fn main() -> Result<()> {
         
         // Update app state at a controlled rate
         if now.duration_since(last_tick) >= tick_rate {
+            // Track view changes to toggle mouse capture
+            let old_view = app.view;
+            
             if let Err(e) = app.update() {
                 debug_log(&format!("App update error: {}", e));
                 app.set_status(format!("Error: {}", e), Color::Red);
+            }
+            
+            // Log view changes and update mouse capture state
+            if old_view != app.view {
+                debug_log(&format!("View changed from {:?} to {:?}", old_view, app.view));
+                
+                // Clear the terminal to prevent artifacts during view transitions
+                let _ = execute!(
+                    terminal.backend_mut(),
+                    crossterm::terminal::Clear(crossterm::terminal::ClearType::All)
+                );
+                debug_log("Cleared terminal for view transition");
+            
+                // Whenever view changes, ensure mouse capture state is correct
+                if app.view == app::AppView::Player {
+                    // Disable mouse capture when entering player view
+                    let _ = execute!(
+                        terminal.backend_mut(),
+                        DisableMouseCapture
+                    );
+                    debug_log("Disabled mouse capture for player view");
+                } else if old_view == app::AppView::Player {
+                    // Re-enable mouse capture when leaving player view
+                    let _ = execute!(
+                        terminal.backend_mut(),
+                        EnableMouseCapture
+                    );
+                    debug_log("Re-enabled mouse capture for UI view");
+                }
             }
         }
         
@@ -301,9 +388,16 @@ fn main() -> Result<()> {
     
     // Clean up any player resources first
     if let Some(player) = &mut app.player {
+        debug_log("CLEANUP: Stopping media player");
         if let Err(e) = player.stop() {
             debug_log(&format!("Error stopping player: {}", e));
         }
+        // Clear any remaining video artifacts
+        let _ = execute!(
+            terminal.backend_mut(),
+            crossterm::terminal::Clear(crossterm::terminal::ClearType::All)
+        );
+        app.player = None; // Ensure player is fully released
     }
     
     // Restore terminal state in a way that ensures cleanup even on panic
@@ -314,11 +408,10 @@ fn main() -> Result<()> {
         disable_raw_mode().context("Failed to disable raw mode")?;
         
         // Execute terminal cleanup commands
-        debug_log("CLEANUP: Leaving alternate screen and disabling mouse capture");
+        debug_log("CLEANUP: Leaving alternate screen");
         execute!(
             terminal.backend_mut(),
-            LeaveAlternateScreen,
-            DisableMouseCapture
+            LeaveAlternateScreen
         ).context("Failed to leave alternate screen")?;
         
         // Show cursor

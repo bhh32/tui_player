@@ -224,12 +224,42 @@ impl TerminalRenderer {
 
     /// Detect the best available rendering method for the current terminal
     pub fn detect_best_method() -> RenderMethod {
-        // Check for Kitty support, but use more cautious detection
-        if std::env::var("KITTY_WINDOW_ID").is_ok() {
+        // First, check if FORCE_RENDER_METHOD is set
+        if let Ok(method) = std::env::var("FORCE_RENDER_METHOD") {
+            match method.to_lowercase().as_str() {
+                "kitty" => {
+                    log::info!("Forced Kitty renderer via environment variable");
+                    return RenderMethod::Kitty;
+                }
+                "blocks" => {
+                    log::info!("Forced Blocks renderer via environment variable");
+                    return RenderMethod::Blocks;
+                }
+                "sixel" => {
+                    log::info!("Forced Sixel renderer via environment variable");
+                    return RenderMethod::Sixel;
+                }
+                "iterm" => {
+                    log::info!("Forced ITerm renderer via environment variable");
+                    return RenderMethod::ITerm;
+                }
+                _ => {
+                    log::warn!("Unknown forced renderer: {}, ignoring", method);
+                }
+            }
+        }
+
+        // More aggressive Kitty detection
+        let has_kitty_env =
+            std::env::var("KITTY_WINDOW_ID").is_ok() || std::env::var("KITTY_PID").is_ok();
+        let term = std::env::var("TERM").unwrap_or_default();
+        let term_has_kitty = term.contains("kitty");
+
+        if has_kitty_env || term_has_kitty {
             log::info!("Detected Kitty terminal, will try Kitty protocol first");
-            // Don't immediately return, just note it for now
-            // We'll validate it actually works during rendering
+            // Don't immediately trust environment variables - verify protocol works
             if Self::check_kitty_support() {
+                log::info!("Kitty graphics protocol is supported, using Kitty renderer");
                 return RenderMethod::Kitty;
             } else {
                 log::warn!(
@@ -323,8 +353,28 @@ impl TerminalRenderer {
 
     /// Render a video frame to the terminal
     pub fn render(&mut self, frame: &VideoFrame) -> Result<()> {
-        // Calculate FPS and adjust quality if needed
-        self.update_performance_metrics();
+        // Check if this is a paused frame (marked with negative timestamp)
+        let is_paused_frame = frame.timestamp < 0.0;
+
+        // For regular playback frames, apply timing and FPS control
+        if !is_paused_frame {
+            // Calculate FPS and adjust quality if needed
+            self.update_performance_metrics();
+
+            // Check if enough time has passed since the last frame to maintain frame rate
+            let elapsed = self.last_frame_time.elapsed();
+            let min_frame_interval =
+                Duration::from_secs_f64(1.0 / (self.config.target_fps * 1.2) as f64);
+
+            // If we're trying to render too frequently, skip this frame (unless it's initial frame)
+            if elapsed < min_frame_interval && !frame.timestamp.eq(&0.0) {
+                // Skip this frame to maintain target FPS, but don't consider it an error
+                trace!("Skipping frame to maintain target FPS");
+                return Ok(());
+            }
+        } else {
+            debug!("Rendering paused frame");
+        }
 
         // Calculate target dimensions with quality adjustment
         let (width, height) = self.calculate_dimensions_with_quality(frame);
@@ -423,7 +473,8 @@ impl TerminalRenderer {
 
         // Track previous method for fallback mechanics
         // Replace static mut fallback state with safe statics
-        static LAST_METHOD: Lazy<StdMutex<Option<RenderMethod>>> = Lazy::new(|| StdMutex::new(None));
+        static LAST_METHOD: Lazy<StdMutex<Option<RenderMethod>>> =
+            Lazy::new(|| StdMutex::new(None));
         static KITTY_FAILED: Lazy<StdMutex<bool>> = Lazy::new(|| StdMutex::new(false));
         static ITERM_FAILED: Lazy<StdMutex<bool>> = Lazy::new(|| StdMutex::new(false));
         static SIXEL_FAILED: Lazy<StdMutex<bool>> = Lazy::new(|| StdMutex::new(false));
@@ -434,10 +485,12 @@ impl TerminalRenderer {
             if *KITTY_FAILED.lock().unwrap() && self.effective_method == RenderMethod::Kitty {
                 debug!("Kitty previously failed, using Blocks instead");
                 RenderMethod::Blocks
-            } else if *ITERM_FAILED.lock().unwrap() && self.effective_method == RenderMethod::ITerm {
+            } else if *ITERM_FAILED.lock().unwrap() && self.effective_method == RenderMethod::ITerm
+            {
                 debug!("iTerm previously failed, using Blocks instead");
                 RenderMethod::Blocks
-            } else if *SIXEL_FAILED.lock().unwrap() && self.effective_method == RenderMethod::Sixel {
+            } else if *SIXEL_FAILED.lock().unwrap() && self.effective_method == RenderMethod::Sixel
+            {
                 debug!("Sixel previously failed, using Blocks instead");
                 RenderMethod::Blocks
             } else if let Some(method) = *LAST_METHOD.lock().unwrap() {
@@ -454,76 +507,109 @@ impl TerminalRenderer {
         // Render based on the effective method with timeout protection
         let result = match current_method {
             RenderMethod::Kitty => {
+                // More robust Kitty rendering with better error handling
                 let kitty_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     // Use a timeout for Kitty rendering
-                    let kitty_timeout = std::time::Duration::from_millis(2000);
+                    let kitty_timeout = std::time::Duration::from_millis(3000); // Longer timeout
                     let start_time = std::time::Instant::now();
 
-                    let render_result = self.render_kitty(&resized_frame);
+                    // Try different approaches if necessary
+                    let mut attempts = 0;
+                    let max_attempts = 2;
+                    let mut last_error = None;
 
-                    if start_time.elapsed() > kitty_timeout {
-                        warn!(
-                            "Kitty rendering took too long ({:?}), may not be functioning properly",
-                            start_time.elapsed()
-                        );
+                    while attempts < max_attempts && start_time.elapsed() < kitty_timeout {
+                        attempts += 1;
+
+                        match self.render_kitty(&resized_frame) {
+                            Ok(_) => return Ok(()),
+                            Err(e) => {
+                                warn!("Kitty rendering attempt {} failed: {}", attempts, e);
+                                last_error = Some(e);
+                                // Small delay before retry
+                                std::thread::sleep(std::time::Duration::from_millis(100));
+                                
+                                // Check if we've exceeded the timeout
+                                if start_time.elapsed() >= kitty_timeout {
+                                    warn!("Kitty rendering timed out after {}ms", kitty_timeout.as_millis());
+                                    break;
+                                }
+                            }
+                        }
                     }
 
-                    render_result
+                    // All attempts failed
+                    Err(anyhow::anyhow!(
+                        "Kitty rendering failed after {} attempts: {:?}",
+                        max_attempts,
+                        last_error
+                    ))
                 }));
 
                 match kitty_result {
                     Ok(Ok(_)) => {
                         debug!("Kitty rendering succeeded");
+                        // Reset the failure flag if it was previously set
+                        if *KITTY_FAILED.lock().unwrap() {
+                            *KITTY_FAILED.lock().unwrap() = false;
+                            info!("Kitty rendering recovered after previous failure");
+                        }
                         Ok(())
                     }
                     Ok(Err(e)) => {
                         error!("Kitty rendering failed: {}", e);
-                        warn!("Permanently falling back to blocks rendering");
-                        *KITTY_FAILED.lock().unwrap() = true;
-                        *LAST_METHOD.lock().unwrap() = Some(RenderMethod::Blocks);
+                        warn!("Temporarily falling back to blocks rendering");
+                        // Only permanently fail after multiple consecutive failures
+                        let mut kitty_failed = KITTY_FAILED.lock().unwrap();
+                        if !*kitty_failed {
+                            warn!("First Kitty failure, will try again next frame");
+                            *kitty_failed = true;
+                        } else {
+                            warn!("Kitty rendering failed multiple times, using blocks for now");
+                        }
+
+                        // Clear the screen to remove artifacts
                         let _ = write!(std::io::stdout(), "\x1B[2J\x1B[H");
                         std::io::stdout().flush().ok();
                         self.render_blocks(&resized_frame)
                     }
                     Err(e) => {
                         error!("Kitty rendering panicked: {:?}", e);
-                        warn!("Permanently falling back to blocks rendering");
+                        warn!("Falling back to blocks rendering after panic");
                         *KITTY_FAILED.lock().unwrap() = true;
                         *LAST_METHOD.lock().unwrap() = Some(RenderMethod::Blocks);
+
+                        // Clear the screen to remove artifacts
                         let _ = write!(std::io::stdout(), "\x1B[2J\x1B[H");
                         std::io::stdout().flush().ok();
                         self.render_blocks(&resized_frame)
                     }
                 }
             }
-            RenderMethod::ITerm => {
-                match self.render_iterm(&resized_frame) {
-                    Ok(_) => Ok(()),
-                    Err(e) => {
-                        error!("iTerm rendering failed: {}", e);
-                        warn!("Permanently falling back to blocks rendering");
-                        *ITERM_FAILED.lock().unwrap() = true;
-                        *LAST_METHOD.lock().unwrap() = Some(RenderMethod::Blocks);
-                        let _ = write!(std::io::stdout(), "\x1B[2J\x1B[H");
-                        std::io::stdout().flush().ok();
-                        self.render_blocks(&resized_frame)
-                    }
+            RenderMethod::ITerm => match self.render_iterm(&resized_frame) {
+                Ok(_) => Ok(()),
+                Err(e) => {
+                    error!("iTerm rendering failed: {}", e);
+                    warn!("Permanently falling back to blocks rendering");
+                    *ITERM_FAILED.lock().unwrap() = true;
+                    *LAST_METHOD.lock().unwrap() = Some(RenderMethod::Blocks);
+                    let _ = write!(std::io::stdout(), "\x1B[2J\x1B[H");
+                    std::io::stdout().flush().ok();
+                    self.render_blocks(&resized_frame)
                 }
-            }
-            RenderMethod::Sixel => {
-                match self.render_sixel(&resized_frame) {
-                    Ok(_) => Ok(()),
-                    Err(e) => {
-                        error!("Sixel rendering failed: {}", e);
-                        warn!("Permanently falling back to blocks rendering");
-                        *SIXEL_FAILED.lock().unwrap() = true;
-                        *LAST_METHOD.lock().unwrap() = Some(RenderMethod::Blocks);
-                        let _ = write!(std::io::stdout(), "\x1B[2J\x1B[H");
-                        std::io::stdout().flush().ok();
-                        self.render_blocks(&resized_frame)
-                    }
+            },
+            RenderMethod::Sixel => match self.render_sixel(&resized_frame) {
+                Ok(_) => Ok(()),
+                Err(e) => {
+                    error!("Sixel rendering failed: {}", e);
+                    warn!("Permanently falling back to blocks rendering");
+                    *SIXEL_FAILED.lock().unwrap() = true;
+                    *LAST_METHOD.lock().unwrap() = Some(RenderMethod::Blocks);
+                    let _ = write!(std::io::stdout(), "\x1B[2J\x1B[H");
+                    std::io::stdout().flush().ok();
+                    self.render_blocks(&resized_frame)
                 }
-            }
+            },
             RenderMethod::Blocks => self.render_blocks(&resized_frame),
             RenderMethod::Auto => {
                 debug!("Using auto rendering method, defaulting to blocks");
@@ -715,56 +801,74 @@ impl TerminalRenderer {
     // Implement specific rendering methods
     /// Check if terminal actually supports Kitty graphics protocol
     fn check_kitty_support() -> bool {
+        use kitty_image::{Action, ActionTransmission, Command, Format, Medium, WrappedCommand};
+        
         // Check for KITTY_WINDOW_ID environment variable
         let has_env = std::env::var("KITTY_WINDOW_ID").is_ok();
         let term = std::env::var("TERM").unwrap_or_default();
         let term_matches = term.contains("kitty");
+        let kitty_version = std::env::var("KITTY_PID").is_ok();
+
+        // If we have clear evidence of Kitty, assume it works
+        if has_env || kitty_version {
+            info!("Detected Kitty terminal via environment variables");
+            return true;
+        }
 
         if !has_env && !term_matches {
             return false;
         }
 
-        // Try a simple test to see if we can display a small image
-        // This will catch cases where the terminal reports as Kitty but doesn't
-        // actually support the graphics protocol
+        // Test using kitty_image crate which handles the protocol properly
         let test_result = std::panic::catch_unwind(|| -> bool {
             // Create a tiny 1x1 test image
             let mut test_image = image::RgbaImage::new(1, 1);
             test_image.put_pixel(0, 0, image::Rgba([255, 0, 0, 255]));
-            let dynamic_img = image::DynamicImage::ImageRgba8(test_image);
-
-            // Save to temp file
-            let temp_file = std::env::temp_dir().join("kitty_test.png");
-            if let Err(_) = dynamic_img.save(&temp_file) {
+            
+            // Save to temp file for testing
+            let temp_path = std::env::temp_dir().join(format!("kitty_test_{}.png", std::process::id()));
+            if let Err(e) = test_image.save(&temp_path) {
+                warn!("Failed to save test image: {}", e);
                 return false;
             }
-
-            // Try to display with kitty protocol
-            let medium = kitty_image::Medium::File;
-            let format = kitty_image::Format::Png;
-
-            let action = kitty_image::Action::TransmitAndDisplay(
-                kitty_image::ActionTransmission {
-                    format,
-                    medium,
+            
+            // Create an action for transmitting the image
+            let action = Action::TransmitAndDisplay(
+                ActionTransmission {
+                    format: Format::Png,
+                    medium: Medium::File,
                     width: 1,
                     height: 1,
                     ..Default::default()
                 },
                 kitty_image::ActionPut::default(),
             );
-
-            let command = kitty_image::Command::with_payload_from_path(action, &temp_file);
-            let wrapped = kitty_image::WrappedCommand::new(command);
-
-            // Try to write to stdout - if this fails, Kitty protocol isn't working
+            
+            // Create a command with the test image
+            let command = Command::with_payload_from_path(action, &temp_path);
+            
+            // Wrap the command in escape codes
+            let wrapped_command = WrappedCommand::new(command);
+            
+            // Try to send the command to stdout
             let mut stdout = std::io::stdout();
-            let write_result = write!(stdout, "{}", wrapped);
-
+            if let Err(e) = write!(stdout, "{}", wrapped_command) {
+                warn!("Failed to write Kitty command: {}", e);
+                let _ = std::fs::remove_file(&temp_path);
+                return false;
+            }
+            
+            // Flush and ensure no errors
+            if let Err(e) = stdout.flush() {
+                warn!("Failed to flush stdout: {}", e);
+                let _ = std::fs::remove_file(&temp_path);
+                return false;
+            }
+            
             // Clean up
-            let _ = std::fs::remove_file(temp_file);
-
-            write_result.is_ok()
+            let _ = std::fs::remove_file(&temp_path);
+            
+            true
         });
 
         match test_result {
@@ -772,50 +876,91 @@ impl TerminalRenderer {
                 info!("Kitty graphics protocol test succeeded");
                 true
             }
-            _ => {
+            Ok(false) => {
                 warn!("Kitty graphics protocol test failed, will use fallback rendering");
+                false
+            }
+            Err(e) => {
+                error!("Kitty test panicked: {:?}", e);
+                warn!("Using fallback rendering due to Kitty test panic");
                 false
             }
         }
     }
 
     fn render_kitty(&mut self, frame: &VideoFrame) -> Result<()> {
-        use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
         use std::io::Write;
-        use image::ImageEncoder;
+        use kitty_image::{Action, ActionTransmission, ActionPut, Command, Format, Medium, WrappedCommand};
+        
+        log::debug!("Rendering frame with Kitty protocol: {}x{}", frame.width, frame.height);
 
-        // Encode the frame as PNG in-memory
-        let mut png_data = Vec::new();
-        {
-            let img = frame.image.to_rgba8();
-            let encoder = image::codecs::png::PngEncoder::new(&mut png_data);
-            encoder.write_image(
-                img.as_raw(),
-                img.width(),
-                img.height(),
-                image::ColorType::Rgba8.into(),
-            )?;
-        }
-        let encoded = BASE64.encode(&png_data);
-        // Kitty protocol: ESC_G ... ESC\\
-        // See https://sw.kovidgoyal.net/kitty/graphics-protocol/
+        // Clear the area first to prevent artifacts
         let mut stdout = std::io::stdout();
+        write!(stdout, "\x1B[{};{}H", self.config.y + 1, self.config.x + 1)?;
+        for y in 0..((frame.height as u16) / 18) + 1 {
+            write!(stdout, "\x1B[{};{}H\x1B[K", self.config.y + 1 + y, self.config.x + 1)?;
+        }
+        
         // Position cursor
         write!(stdout, "\x1B[{};{}H", self.config.y + 1, self.config.x + 1)?;
-        // Compose the escape sequence
-        let seq = format!(
-            "\x1B_Gf=100,a=T,s={},v={},m=1;{}\x1B\\",
-            frame.width,
-            frame.height,
-            encoded
+        
+        // Create a unique ID for this frame by combining process ID and timestamp
+        let frame_id = ((std::process::id() as u32) ^ 
+                        (frame.timestamp.abs() as u32)) & 0xFFFFFF;
+                        
+        // Create a temporary file for the frame with unique ID
+        let temp_path = std::env::temp_dir().join(format!("kitty_frame_{}_{}.png", std::process::id(), frame_id));
+        
+        // Clean up previous temporary file if exists
+        if let Some(prev_file) = &self.last_kitty_temp_file {
+            if prev_file.exists() {
+                let _ = std::fs::remove_file(prev_file);
+            }
+        }
+        
+        // Save current frame to temp file
+        if let Err(e) = frame.image.save(&temp_path) {
+            return Err(anyhow::anyhow!("Failed to save frame to temp file: {}", e));
+        }
+        
+        // Store this temp file path for later cleanup
+        self.last_kitty_temp_file = Some(temp_path.clone());
+        
+        // Create an action to transmit and display the image
+        let action = Action::TransmitAndDisplay(
+            ActionTransmission {
+                format: Format::Png,
+                medium: Medium::File,
+                width: frame.width as u32,
+                height: frame.height as u32,
+                ..Default::default()
+            },
+            ActionPut {
+                x_offset: self.config.x as u32,
+                y_offset: self.config.y as u32,
+                z_index: 1,
+                ..Default::default()
+            },
         );
-        write!(stdout, "{}", seq)?;
+        
+        // Create a command with the image from path
+        let command = Command::with_payload_from_path(action, &temp_path);
+        
+        // Wrap the command in escape codes
+        let wrapped_command = WrappedCommand::new(command);
+        
+        // Send the command to stdout
+        if let Err(e) = write!(stdout, "{}", wrapped_command) {
+            return Err(anyhow::anyhow!("Kitty image command failed: {}", e));
+        }
+        
         stdout.flush()?;
+        log::trace!("Kitty render complete for frame at t={:.2}s", frame.timestamp);
         Ok(())
     }
 
     fn render_iterm(&self, frame: &VideoFrame) -> Result<()> {
-        use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
+        use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
         use image::ImageEncoder;
         use std::io::Write;
         // Encode the frame as PNG in-memory
@@ -858,7 +1003,11 @@ impl TerminalRenderer {
         let mut sixel = Vec::new();
         sixel.extend_from_slice(b"\x1BPq");
         for (i, color) in palette.iter().enumerate() {
-            write!(&mut sixel, "#{};2;{};{};{}", i, color[0], color[1], color[2])?;
+            write!(
+                &mut sixel,
+                "#{};2;{};{};{}",
+                i, color[0], color[1], color[2]
+            )?;
         }
         let rows = (height + 5) / 6;
         for y_block in 0..rows {
@@ -870,13 +1019,20 @@ impl TerminalRenderer {
                         let y = y_block * 6 + bit;
                         if y < height {
                             let px = img.get_pixel(x as u32, y as u32).0;
-                            let idx = palette.iter().enumerate().min_by_key(|(_, c)| {
-                                let dr = px[0] as i16 - c[0] as i16;
-                                let dg = px[1] as i16 - c[1] as i16;
-                                let db = px[2] as i16 - c[2] as i16;
-                                dr * dr + dg * dg + db * db
-                            }).map(|(i, _)| i).unwrap_or(0);
-                            if idx == color_idx { pattern |= 1 << bit; }
+                            let idx = palette
+                                .iter()
+                                .enumerate()
+                                .min_by_key(|(_, c)| {
+                                    let dr = px[0] as i16 - c[0] as i16;
+                                    let dg = px[1] as i16 - c[1] as i16;
+                                    let db = px[2] as i16 - c[2] as i16;
+                                    dr * dr + dg * dg + db * db
+                                })
+                                .map(|(i, _)| i)
+                                .unwrap_or(0);
+                            if idx == color_idx {
+                                pattern |= 1 << bit;
+                            }
                         }
                     }
                     col_data.push(pattern);
@@ -893,7 +1049,9 @@ impl TerminalRenderer {
                         sixel.push(b' ');
                     }
                 }
-                if started { sixel.push(b'$'); }
+                if started {
+                    sixel.push(b'$');
+                }
             }
             sixel.push(b'-');
         }
@@ -940,12 +1098,15 @@ impl TerminalRenderer {
     fn get_color_code(&self, fg: [u16; 3], bg: [u16; 3]) -> String {
         let mut cache = self.color_code_cache.lock();
         let key = (fg, bg);
-        cache.entry(key).or_insert_with(|| {
-            format!(
-                "\x1B[38;2;{};{};{};48;2;{};{};{}m",
-                fg[0], fg[1], fg[2], bg[0], bg[1], bg[2]
-            )
-        }).clone()
+        cache
+            .entry(key)
+            .or_insert_with(|| {
+                format!(
+                    "\x1B[38;2;{};{};{};48;2;{};{};{}m",
+                    fg[0], fg[1], fg[2], bg[0], bg[1], bg[2]
+                )
+            })
+            .clone()
     }
 
     fn simd_blend_alpha(top: &[u8], bot: &[u8]) -> ([u16; 3], [u16; 3]) {
@@ -958,8 +1119,13 @@ impl TerminalRenderer {
             let b = (fg[2] as u16 * a + bg[2] as u16 * (255 - a)) / 255;
             [r, g, b]
         };
-        ([blend(&top.try_into().unwrap(), &[0,0,0,255]), blend(&bot.try_into().unwrap(), &[0,0,0,255])][0],
-         [blend(&bot.try_into().unwrap(), &[0,0,0,255])][0])
+        (
+            [
+                blend(&top.try_into().unwrap(), &[0, 0, 0, 255]),
+                blend(&bot.try_into().unwrap(), &[0, 0, 0, 255]),
+            ][0],
+            [blend(&bot.try_into().unwrap(), &[0, 0, 0, 255])][0],
+        )
     }
 
     fn render_blocks(&mut self, frame: &VideoFrame) -> Result<()> {
@@ -968,9 +1134,13 @@ impl TerminalRenderer {
         let width = img.width() as usize;
         let height = img.height() as usize;
         let visible_width = width.min(self.term_width as usize - self.config.x as usize);
-        let visible_height = (height.min(self.term_height as usize * 2 - self.config.y as usize) + 1) / 2;
+        let visible_height =
+            (height.min(self.term_height as usize * 2 - self.config.y as usize) + 1) / 2;
         if visible_width == 0 || visible_height == 0 {
-            warn!("Cannot render frame - visible area is zero: {}x{}", visible_width, visible_height);
+            warn!(
+                "Cannot render frame - visible area is zero: {}x{}",
+                visible_width, visible_height
+            );
             return Ok(());
         }
         let mut stdout = std::io::stdout();
@@ -1016,78 +1186,93 @@ impl TerminalRenderer {
             }
         }
         // Parallel row rendering
-        let rendered_rows: Vec<String> = (0..visible_height).into_par_iter().map(|y| {
-            if dirty_rows[y] {
-                let mut row = String::with_capacity(visible_width * 25);
-                row.push_str(&format!("\x1B[{};{}H", self.config.y as usize + y + 1, self.config.x as usize + 1));
-                let mut last_fg_color = [999u16; 3];
-                let mut last_bg_color = [999u16; 3];
-                let mut last_code = String::new();
-                let mut run_len = 0;
-                let mut run_char = ' ';
-                let mut top_rgba = [0u8; 4];
-                let mut bot_rgba = [0u8; 4];
-                for x in 0..visible_width {
-                    if col_transparent[x] {
-                        if run_char != ' ' {
-                            row.push_str(&last_code);
-                            for _ in 0..run_len { row.push(run_char); }
-                            run_len = 0;
+        let rendered_rows: Vec<String> = (0..visible_height)
+            .into_par_iter()
+            .map(|y| {
+                if dirty_rows[y] {
+                    let mut row = String::with_capacity(visible_width * 25);
+                    row.push_str(&format!(
+                        "\x1B[{};{}H",
+                        self.config.y as usize + y + 1,
+                        self.config.x as usize + 1
+                    ));
+                    let mut last_fg_color = [999u16; 3];
+                    let mut last_bg_color = [999u16; 3];
+                    let mut last_code = String::new();
+                    let mut run_len = 0;
+                    let mut run_char = ' ';
+                    let mut top_rgba = [0u8; 4];
+                    let mut bot_rgba = [0u8; 4];
+                    for x in 0..visible_width {
+                        if col_transparent[x] {
+                            if run_char != ' ' {
+                                row.push_str(&last_code);
+                                for _ in 0..run_len {
+                                    row.push(run_char);
+                                }
+                                run_len = 0;
+                            }
+                            run_char = ' ';
+                            run_len += 1;
+                            continue;
                         }
-                        run_char = ' ';
-                        run_len += 1;
-                        continue;
-                    }
-                    let y_top = y * 2;
-                    let y_bottom = y * 2 + 1;
-                    top_rgba.copy_from_slice(&img.get_pixel(x as u32, y_top as u32).0);
-                    if y_bottom < height {
-                        bot_rgba.copy_from_slice(&img.get_pixel(x as u32, y_bottom as u32).0);
-                    } else {
-                        bot_rgba = [0, 0, 0, 255];
-                    }
-                    if top_rgba[3] == 0 && bot_rgba[3] == 0 {
-                        if run_char != ' ' {
-                            row.push_str(&last_code);
-                            for _ in 0..run_len { row.push(run_char); }
-                            run_len = 0;
+                        let y_top = y * 2;
+                        let y_bottom = y * 2 + 1;
+                        top_rgba.copy_from_slice(&img.get_pixel(x as u32, y_top as u32).0);
+                        if y_bottom < height {
+                            bot_rgba.copy_from_slice(&img.get_pixel(x as u32, y_bottom as u32).0);
+                        } else {
+                            bot_rgba = [0, 0, 0, 255];
                         }
-                        run_char = ' ';
-                        run_len += 1;
-                        continue;
-                    }
-                    let (top_rgb, bot_rgb) = Self::simd_blend_alpha(&top_rgba, &bot_rgba);
-                    let fg_changed = top_rgb != last_fg_color;
-                    let bg_changed = bot_rgb != last_bg_color;
-                    let code = if fg_changed || bg_changed {
-                        self.get_color_code(top_rgb, bot_rgb)
-                    } else {
-                        last_code.clone()
-                    };
-                    if run_char != '▀' || code != last_code {
-                        if run_len > 0 {
-                            row.push_str(&last_code);
-                            for _ in 0..run_len { row.push(run_char); }
+                        if top_rgba[3] == 0 && bot_rgba[3] == 0 {
+                            if run_char != ' ' {
+                                row.push_str(&last_code);
+                                for _ in 0..run_len {
+                                    row.push(run_char);
+                                }
+                                run_len = 0;
+                            }
+                            run_char = ' ';
+                            run_len += 1;
+                            continue;
                         }
-                        run_char = '▀';
-                        run_len = 1;
-                        last_code = code.clone();
-                        last_fg_color = top_rgb;
-                        last_bg_color = bot_rgb;
-                    } else {
-                        run_len += 1;
+                        let (top_rgb, bot_rgb) = Self::simd_blend_alpha(&top_rgba, &bot_rgba);
+                        let fg_changed = top_rgb != last_fg_color;
+                        let bg_changed = bot_rgb != last_bg_color;
+                        let code = if fg_changed || bg_changed {
+                            self.get_color_code(top_rgb, bot_rgb)
+                        } else {
+                            last_code.clone()
+                        };
+                        if run_char != '▀' || code != last_code {
+                            if run_len > 0 {
+                                row.push_str(&last_code);
+                                for _ in 0..run_len {
+                                    row.push(run_char);
+                                }
+                            }
+                            run_char = '▀';
+                            run_len = 1;
+                            last_code = code.clone();
+                            last_fg_color = top_rgb;
+                            last_bg_color = bot_rgb;
+                        } else {
+                            run_len += 1;
+                        }
                     }
+                    if run_len > 0 {
+                        row.push_str(&last_code);
+                        for _ in 0..run_len {
+                            row.push(run_char);
+                        }
+                    }
+                    row.push_str("\x1B[0m");
+                    row
+                } else {
+                    String::new()
                 }
-                if run_len > 0 {
-                    row.push_str(&last_code);
-                    for _ in 0..run_len { row.push(run_char); }
-                }
-                row.push_str("\x1B[0m");
-                row
-            } else {
-                String::new()
-            }
-        }).collect();
+            })
+            .collect();
         for row in rendered_rows {
             if !row.is_empty() {
                 output.push_str(&row);

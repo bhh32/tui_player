@@ -7,7 +7,7 @@ use std::path::Path;
 use anyhow::{Result, anyhow};
 
 // Re-exports
-pub use video::{MediaInfo, VideoFrame, decoder::VideoDecoder};
+pub use video::{MediaInfo, VideoFrame, decoder::VideoDecoder, FrameBuffer};
 pub use media::{MediaPlayer, LocalMediaPlayer, YouTubePlayer, YouTubeConfig, YouTubeVideoInfo};
 
 /// Type of media source

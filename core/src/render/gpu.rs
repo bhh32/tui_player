@@ -3,7 +3,7 @@ use bytemuck::{Pod, Zeroable};
 use futures_intrusive::channel::shared;
 use anyhow::{Result, Context, anyhow};
 use std::time::Duration;
-use log::{debug, info, warn, error};
+use log::{warn, error};
 use futures::FutureExt;
 
 use crate::video::VideoFrame;
