@@ -1,13 +1,20 @@
 //! Kitty protocol display handler
 
 use crate::renderer::types::*;
-use anyhow::{Context, Result};
+use anyhow::Result;
 use crossbeam_channel::{Receiver, Sender};
-use crossterm::terminal;
+use crossterm::{
+    event::{Event, EventStream, KeyEvent},
+    terminal,
+};
+use futures_util::stream::StreamExt;
+use kitty_image::{
+    Action, ActionDelete, ActionPut, ActionTransmission, Command, Format, Medium, WrappedCommand,
+};
 use std::io::{self, Write};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tokio::sync::RwLock;
+use tokio::{select, sync::RwLock};
 
 /// Kitty protocol display handler
 #[derive(Clone)]
@@ -57,56 +64,100 @@ impl KittyDisplay {
         // Clear terminal and setup
         self.setup_terminal().await?;
 
+        // Create event stream for terminal events
+        let mut event_stream = EventStream::new();
+
         let display_start = Instant::now();
         let mut frames_displayed = 0u64;
         let mut last_frame_time = Instant::now();
+        let mut last_displayed_frame: Option<ProcessedFrame> = None;
+
+        // Frame timing control for 30fps
+        let target_fps = 30.0;
+        let frame_duration = Duration::from_secs_f64(1.0 / target_fps);
+        let mut next_frame_time = Instant::now();
+        let mut playback_paused = false;
 
         loop {
-            // Check for commands (non-blocking)
-            if let Ok(cmd) = cmd_rx.try_recv() {
-                match cmd {
-                    PlaybackCommand::Stop => {
-                        log::info!("Kitty display received stop command");
-                        break;
-                    }
-                    _ => {
-                        // Other commands will be handled by scheduler
-                        log::debug!("Kitty display received command: {cmd:?}");
-                    }
-                }
-            }
+            select! {
+                // Handle terminal events (including resize)
+                maybe_event = event_stream.next() => {
+                    if let Some(Ok(event)) = maybe_event {
+                        match event {
+                            Event::Resize(cols, rows) => {
+                                self.handle_terminal_resize(cols, rows, &last_displayed_frame).await?;
+                            },
+                            Event::Key(KeyEvent { .. }) => {
+                                // Handle key events (like 'q' for quit) if needed
 
-            // Try to receive frame (non-blocking)
-            if let Ok(frame) = frame_rx.try_recv() {
-                // Display frame
-                match self.display_frame(&frame).await {
-                    Ok(_) => {
-                        frames_displayed += 1;
-
-                        // Update stats
-                        self.update_display_stats(frames_displayed, display_start, last_frame_time)
-                            .await;
-
-                        // Send status update periodically
-                        if frames_displayed % 30 == 0 {
-                            let stats = self.stats.read().await;
-                            let _ = status_tx.send(RenderStatus::DisplayStatus {
-                                frames_rendered: frames_displayed,
-                                display_fps: stats.display_fps,
-                                terminal_size: self.terminal_size,
-                            });
+                                // For now, just logging
+                                log::debug!("Key event received in display loop");
+                            },
+                            _ => {}
                         }
-
-                        last_frame_time = Instant::now();
-                    }
-                    Err(e) => {
-                        log::error!("Failed to display frame {}: {e}", frame.frame_number);
-                        let _ = status_tx.send(RenderStatus::Error(format!("Display error: {e}")));
                     }
                 }
-            } else {
-                // No frame available, sleep briefly
-                tokio::time::sleep(Duration::from_millis(1)).await;
+
+                // Handle frame display
+                _ = tokio::time::sleep(Duration::from_millis(1)) => {
+                    let now = Instant::now();
+
+                    // Check for commands (non-blocking)
+                    if let Ok(cmd) = cmd_rx.try_recv() {
+                        match cmd {
+                            PlaybackCommand::Stop => {
+                                log::info!("Kitty display received stop command");
+                                break;
+                            },
+                            PlaybackCommand::Play => {
+                                playback_paused = false;
+                                next_frame_time = now; // Reset timing
+                                log::info!("Playback resumed");
+                            },
+                            PlaybackCommand::Pause => {
+                                playback_paused = true;
+                                log::info!("Playback Paused");
+                            },
+                            _ => {
+                                log::debug!("Kitty display received command: {cmd:?}");
+                            }
+                        }
+                    }
+                    if !playback_paused && now > next_frame_time {
+                        // Try to receive frame (non-blocking)
+                        if let Ok(frame) = frame_rx.try_recv() {
+                            // Display the frame
+                            match self.display_frame(&frame).await {
+                                Ok(_) => {
+                                    frames_displayed += 1;
+                                    last_displayed_frame = Some(frame.clone());
+
+                                    // Calculate next frame time for precise timing
+                                    next_frame_time = now + frame_duration;
+
+                                    // Update stats
+                                    self.update_display_stats(frames_displayed, display_start, last_frame_time).await;
+
+                                    // Send status update periodically
+                                    if frames_displayed % 30 == 0 {
+                                        let stats = self.stats.read().await;
+                                        let _ = status_tx.send(RenderStatus::DisplayStatus {
+                                            frames_rendered: frames_displayed,
+                                            display_fps: stats.display_fps,
+                                            terminal_size: self.terminal_size,
+                                        });
+                                    }
+
+                                    last_frame_time = Instant::now();
+                                },
+                                Err(e) => {
+                                    log::error!("Failed to display frame {}: {e}", frame.frame_number);
+                                    let _ = status_tx.send(RenderStatus::Error(format!("Display error: {e}")));
+                                }
+                            }
+                        }
+                    }
+                }
             }
         }
 
@@ -117,15 +168,76 @@ impl KittyDisplay {
         Ok(())
     }
 
-    /// Check if terminal supports Kitty graphics protocol
-    async fn check_kitty_support(&self) -> Result<bool> {
-        // Query terminal capabilities using Kitty protocol detection
-        print!("\x1b_Gi=1,a=q;\x1b\\");
+    /// Handle terminal resize events
+    async fn handle_terminal_resize(
+        &mut self,
+        new_cols: u16,
+        new_rows: u16,
+        last_frame: &Option<ProcessedFrame>,
+    ) -> Result<()> {
+        let old_size = self.terminal_size;
+        self.update_terminal_size((new_cols, new_rows));
+
+        log::info!(
+            "Terminal resized: {}x{} -> {}x{}",
+            old_size.0,
+            old_size.1,
+            new_cols,
+            new_rows
+        );
+
+        // Clear terminal to avoid display artifacts
+        self.clear_terminal().await?;
+
+        // If we have a frame displayed, re-display it with new dimensions
+        if let Some(frame) = last_frame {
+            log::debug!("Re-displaying frame {} after resize", frame.frame_number);
+
+            // Re-display the last frame with new terminal dimensions
+            if let Err(e) = self.display_frame(frame).await {
+                log::error!("Failed to re-display frame after resize: {e}");
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Clear terminal content
+    async fn clear_terminal(&self) -> Result<()> {
+        // Clear all images
+        print!("\x1b_Ga=d;\x1b\\");
+
+        // Clear screen content
+        print!("\x1b[2J\x1b[H");
+
         io::stdout().flush()?;
 
-        // For now, assume support if config enables it
-        // TODO: Parse the terminal response
-        Ok(self.config.kitty_features.transmit_images)
+        Ok(())
+    }
+
+    /// Check if terminal supports Kitty graphics protocol
+    async fn check_kitty_support(&self) -> Result<bool> {
+        // Check if this is a Kitty supported terminal
+        if let Ok(term) = std::env::var("TERM") {
+            let is_kitty = term.contains("kitty");
+
+            log::info!("Terminal type: {term}, Kitty support: {is_kitty}");
+
+            if is_kitty {
+                // Send a query to check graphics support
+                let query_action = Action::Query;
+                let query_command = Command::new(query_action);
+                let wrapped_query = WrappedCommand::new(query_command);
+
+                print!("{wrapped_query}");
+                io::stdout().flush()?;
+            }
+
+            Ok(is_kitty && self.config.kitty_features.transmit_images)
+        } else {
+            log::warn!("Could not determine terminal type");
+            Ok(false)
+        }
     }
 
     /// Setup terminal for video display
@@ -140,53 +252,65 @@ impl KittyDisplay {
         print!("\x1b[?1049h");
 
         io::stdout().flush()?;
+
+        log::info!("Terminal setup complete for Kitty protocol");
         Ok(())
     }
 
     /// Display a single frame using Kitty protocol
     async fn display_frame(&mut self, frame: &ProcessedFrame) -> Result<()> {
-        // Get next image ID
-        let image_id = {
-            let mut counter = self.image_id_counter.write().await;
-            let id = *counter;
-            *counter += 1;
-            id
-        };
-
-        // Calculate display dimensions based on terminal size
+        // Validate dimensions
         let (display_cols, display_rows) = self.calculate_display_size(frame.dimensions);
 
-        // Encode frame as base64 for transmission
-        let encoded_data = self.encode_frame_for_kitty(frame).await?;
-
-        // Clear previous image (if any)
-        if image_id > 1 {
-            self.clear_previous_image(image_id - 1).await?;
+        if display_cols == 0 || display_rows == 0 {
+            log::warn!(
+                "Skipping frame with zero dimensions: {}x{}",
+                display_cols,
+                display_rows
+            );
+            return Ok(());
         }
 
-        // Position cursor for image display
-        print!("\x1b[1;1H"); // Move to top-left
+        let (frame_width, frame_height) = frame.dimensions;
+        if frame_width == 0 || frame_height == 0 {
+            log::warn!(
+                "Skipping frame with zero source dimensions: {}x{}",
+                frame_width,
+                frame_height
+            );
+            return Ok(());
+        }
 
-        // Send Kitty graphics command
-        let kitty_command = format!(
-            "\x1b_Gf=100,a=T,i={},s={},v={},c={},r={};\x1b\\",
-            image_id,
-            frame.dimensions.0, // source width
-            frame.dimensions.1, // source height
-            display_cols,       // display columns
-            display_rows,       // display rows
+        // Create the Kitty graphics command
+        let action = Action::TransmitAndDisplay(
+            ActionTransmission {
+                format: Format::Png,
+                medium: Medium::File,
+                width: frame_width,
+                height: frame_height,
+                ..Default::default()
+            },
+            ActionPut::default(),
         );
 
-        print!("{kitty_command}");
+        // Get the image data
+        let temp_file = format!("/tmp/kitty_frame_{}.png", frame.frame_number);
+        frame.image.save(&temp_file)?; // Save as PNG
 
-        // Send image data in chunks
-        self.send_image_data(&encoded_data, image_id).await?;
+        // Create command with payload
+        let command = Command::with_payload_from_path(action, temp_file.as_ref());
 
-        // Display the image
-        let display_command = format!("\x1b_Ga=p,i={image_id};\x1b\\");
-        print!("{display_command}");
+        // Wrap the command with proper escape sequences
+        let wrapped_command = WrappedCommand::new(command);
 
+        // Display the wrapped command
+        print!("{wrapped_command}");
         io::stdout().flush()?;
+
+        // Clean up temp file
+        let _ = std::fs::remove_file(&temp_file);
+
+        log::debug!("Frame {} displayed via Kitty protocol", frame.frame_number);
 
         Ok(())
     }
@@ -226,51 +350,7 @@ impl KittyDisplay {
         (display_cols, display_rows)
     }
 
-    /// Encode frame data for Kitty protocol transmission
-    async fn encode_frame_for_kitty(&self, frame: &ProcessedFrame) -> Result<String> {
-        // Convert RgbaImage to bytes
-        let image_bytes = frame.image.as_raw();
-
-        // Encode as base64
-        let encoded = base64::encode(image_bytes);
-
-        Ok(encoded)
-    }
-
-    /// Send image data to terminal in chunks
-    async fn send_image_data(&self, encoded_data: &str, image_id: u32) -> Result<()> {
-        const CHUNK_SIZE: usize = 4096; // Kitty protocol chunk size limit
-
-        let chunks: Vec<&str> = encoded_data
-            .as_bytes()
-            .chunks(CHUNK_SIZE)
-            .map(|chunk| std::str::from_utf8(chunk).unwrap())
-            .collect();
-
-        for (i, chunk) in chunks.iter().enumerate() {
-            let is_last = i == chunks.len() - 1;
-            let more_flag = if is_last { 0 } else { 1 };
-
-            let chunk_command = format!("\x1b_Gm={more_flag},i={image_id};\x1b\\{chunk}");
-
-            print!("{chunk_command}");
-        }
-
-        io::stdout().flush()?;
-        Ok(())
-    }
-
-    /// Clear previous image from terminal
-    async fn clear_previous_image(&self, image_id: u32) -> Result<()> {
-        let clear_command = format!("\x1b_Ga=d,i={image_id};\x1b\\");
-
-        print!("{clear_command}");
-        io::stdout().flush()?;
-
-        Ok(())
-    }
-
-    /// Update display statistics
+    // Update display stats
     async fn update_display_stats(
         &self,
         frames_displayed: u64,
@@ -290,25 +370,39 @@ impl KittyDisplay {
         // Calculate avg display time
         stats.avg_display_time = last_frame_time.elapsed();
 
-        // Estimate terminal refresh rate (simplified)
+        // Log timing info periodically
+        if frames_displayed % 300 == 0 {
+            // Every 10 secs at 30fps
+            let target_fps = 30.0;
+            let fps_accuracy = (stats.display_fps / target_fps * 100.0).min(100.0);
+
+            log::info!(
+                "Display timing - Target: {target_fps:.1}fps, Actual: {:.1}fps ({fps_accuracy:.1}% accuracy)",
+                stats.display_fps
+            );
+        }
+
         stats.terminal_refresh_rate = stats.display_fps;
     }
 
     /// Cleanup terminal state
     async fn cleanup_terminal(&self) -> Result<()> {
-        // Clear all images
-        print!("\x1b_Ga=d;\x1b\\");
+        // Clear all Kitty images properly
+        let clear_action = Action::Delete(ActionDelete {
+            hard: true,
+            target: kitty_image::DeleteTarget::Placements,
+        });
+        let clear_command = Command::new(clear_action);
+        let wrapped_clear = WrappedCommand::new(clear_command);
 
-        // Exit alternate screen buffer
-        print!("\x1b[?10491");
+        print!("{wrapped_clear}");
 
-        // Show cursor
+        print!("\x1b[?1049l");
         print!("\x1b[?25h");
-
-        // Clear screen
         print!("\x1b[2J\x1b[H");
 
         io::stdout().flush()?;
+
         Ok(())
     }
 
@@ -352,6 +446,6 @@ mod tests {
         let (cols, rows) = display.calculate_display_size((720, 720));
 
         assert!(cols <= 80);
-        assert!(cols <= 24);
+        assert!(rows <= 24);
     }
 }
